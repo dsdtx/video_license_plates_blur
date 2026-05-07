@@ -10,18 +10,20 @@ New to the project or setting it up on a fresh machine? Copy and paste the promp
 
 ---
 
-> I want to set up and use this open-source tool that automatically detects and blurs license plates in dashcam and action-cam videos: https://github.com/dsdtx/video_license_plates_blur
+> I want to set up and use this tool that automatically detects and blurs license plates in dashcam and action-cam videos: https://github.com/dsdtx/video_license_plates_blur
 >
-> Please help me get it fully running from scratch. Here is what I need help with:
+> Before doing anything else, silently run the necessary checks to figure out my environment yourself — detect my OS, check if Python is installed and what version, check if ffmpeg is installed and on PATH, and check if I have an NVIDIA GPU available. Do not ask me for any of this information.
 >
-> 1. **Clone the repo** — guide me through cloning it to my machine.
-> 2. **Install ffmpeg** — I am on [Windows / macOS / Linux — pick yours]. Show me the simplest way to install ffmpeg and make sure it is on my PATH.
-> 3. **Set up a Python virtual environment** — help me create one, activate it, and install all required dependencies including PyTorch with CUDA if I have an NVIDIA GPU, or CPU-only if I don't.
-> 4. **Download the model weights** — the model files are not included in the repo. Guide me to download the right `.pt` file from HuggingFace (morsetechlab/yolov11-license-plate-detection) and place it in the correct folder.
-> 5. **Run a test** — help me run the script on a short clip to make sure everything works, using debug mode first so I can see what is being detected before actually blurring anything.
-> 6. **Explain config.toml** — walk me through the key settings I am most likely to want to adjust.
+> Then take me through the full setup in this order, giving me one step at a time and waiting for me to confirm before moving on:
 >
-> My setup: [describe your OS, whether you have an NVIDIA GPU, and your Python version if you know it]
+> 1. **Clone the repo** to a sensible location based on my OS.
+> 2. **Install ffmpeg** if it is not already installed, using the best method for my OS (winget, brew, apt, etc.) and verify it is on PATH.
+> 3. **Create a Python virtual environment** inside the cloned folder, activate it, and install all dependencies — use CUDA-enabled PyTorch if I have an NVIDIA GPU, CPU-only otherwise. Detect this automatically.
+> 4. **Download the model weights** from HuggingFace (morsetechlab/yolov11-license-plate-detection) — recommend the right size variant based on whether I have a GPU, and place it in the correct folder automatically.
+> 5. **Run a quick debug test** on any video file I have so I can see detections before any real blurring happens.
+> 6. **Explain config.toml** in plain language — only the settings I am likely to actually change.
+>
+> Keep instructions short and copy-pasteable. If something fails, diagnose it and fix it before moving on.
 
 ---
 
