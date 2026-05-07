@@ -1,0 +1,43 @@
+# ── Detection ──────────────────────────────────────────────────────────────────
+[detection]
+
+# YOLOv8 vehicle detector confidence (car / motorcycle / bus / truck)
+vehicle_conf = 0.30
+
+# Plate model — minimum confidence for plates detected anywhere on the frame
+plate_conf = 0.15
+
+# Plate model — lower threshold applied only when a plate overlaps a detected
+# vehicle bounding box. Set lower than plate_conf to catch blurry / angled
+# plates on fast-moving vehicles (e.g. motorbikes on the Autobahn).
+plate_conf_in_vehicle = 0.10
+
+
+# ── SAHI sliced inference ──────────────────────────────────────────────────────
+[sahi]
+
+# Tile size in pixels — smaller = more detail at the cost of speed
+slice_size = 640
+
+# Fractional overlap between adjacent tiles (0.0 – 0.5)
+overlap = 0.20
+
+
+# ── Blur ───────────────────────────────────────────────────────────────────────
+[blur]
+
+# Gaussian blur kernel size — must be odd; larger = stronger blur
+strength = 61
+
+# Extra pixels added around each detected plate region
+padding = 8
+
+
+# ── Output / encoding ─────────────────────────────────────────────────────────
+[output]
+
+# libx265 preset for final HEVC encode (ultrafast / fast / medium / slow)
+preset = "medium"
+
+# Directory for temporary lossless intermediate files (needs ~2x input size free)
+tmp_dir = "D:/pip-tmp"

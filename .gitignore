@@ -1,0 +1,29 @@
+# Model weights — download from HuggingFace, don't commit
+*.pt
+*.onnx
+
+# Debug and output frames
+Debug/
+training_frames/
+runs/
+
+# Video files
+*.mov
+*.mp4
+*.mkv
+*.avi
+*.mts
+*.m4v
+
+# HuggingFace cache
+.cache/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs and test artefacts
+*.log
+test_frame.png
+test_frame_blurred.png
