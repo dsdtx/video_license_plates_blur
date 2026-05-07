@@ -4,6 +4,27 @@ Automatically detects and blurs license plates in dashcam / action-cam footage u
 
 ---
 
+## AI Setup Prompt
+
+New to the project or setting it up on a fresh machine? Copy and paste the prompt below into any AI assistant (Claude, ChatGPT, etc.) and it will guide you through the entire setup interactively:
+
+---
+
+> I want to set up and use this open-source tool that automatically detects and blurs license plates in dashcam and action-cam videos: https://github.com/dsdtx/video_license_plates_blur
+>
+> Please help me get it fully running from scratch. Here is what I need help with:
+>
+> 1. **Clone the repo** — guide me through cloning it to my machine.
+> 2. **Install ffmpeg** — I am on [Windows / macOS / Linux — pick yours]. Show me the simplest way to install ffmpeg and make sure it is on my PATH.
+> 3. **Set up a Python virtual environment** — help me create one, activate it, and install all required dependencies including PyTorch with CUDA if I have an NVIDIA GPU, or CPU-only if I don't.
+> 4. **Download the model weights** — the model files are not included in the repo. Guide me to download the right `.pt` file from HuggingFace (morsetechlab/yolov11-license-plate-detection) and place it in the correct folder.
+> 5. **Run a test** — help me run the script on a short clip to make sure everything works, using debug mode first so I can see what is being detected before actually blurring anything.
+> 6. **Explain config.toml** — walk me through the key settings I am most likely to want to adjust.
+>
+> My setup: [describe your OS, whether you have an NVIDIA GPU, and your Python version if you know it]
+
+---
+
 ## Requirements
 
 - Python 3.11+
