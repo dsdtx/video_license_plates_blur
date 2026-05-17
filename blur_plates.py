@@ -416,8 +416,9 @@ def estimate_frame_count(info, start_sec, end_sec):
 
 
 _DBG_VEHICLE_COLOR = (255, 100,   0)   # blue
-_DBG_PLATE_COLOR   = (  0, 220,   0)   # green
-_DBG_OWN_COLOR     = (  0, 140, 255)   # orange
+_DBG_PLATE_COLOR   = (  0, 220,   0)   # green  — raw model detection
+_DBG_BLUR_COLOR    = (  0,   0, 220)   # red    — padded blur region
+_DBG_OWN_COLOR     = (  0, 140, 255)   # orange — own plate fixed region
 _DBG_FONT          = cv2.FONT_HERSHEY_SIMPLEX
 
 
@@ -430,26 +431,47 @@ def _dbg_box(img, x1, y1, x2, y2, color, label, thickness=3):
 
 
 def draw_debug_overlay(frame, plate_rects, all_vehicles, own_plate_region=None,
-                       blur_padding=8):
-    """Return a copy of frame with detection boxes drawn instead of blurs."""
+                       blur_padding=8, blur_strength=61):
+    """
+    Returns a debug frame that shows exactly what the production output will look like:
+      - Blur is applied to all detected regions (identical to production)
+      - Green box  = raw model detection boundary
+      - Red box    = padded blur region (what was actually erased)
+      - Blue box   = vehicle detection
+      - Orange box = own-plate fixed region
+    """
     h, w = frame.shape[:2]
     vis = frame.copy()
 
+    # ── Step 1: apply the real blur so the frame looks like production output ──
+    all_rects = list(plate_rects)
+    if own_plate_region:
+        all_rects.append(own_plate_region)
+    if all_rects:
+        vis = apply_blur(vis, all_rects, blur_strength=blur_strength, padding=blur_padding)
+
+    # ── Step 2: vehicle boxes (blue) ──────────────────────────────────────────
     for (cls, x1, y1, x2, y2, conf) in all_vehicles:
         _dbg_box(vis, x1, y1, x2, y2, _DBG_VEHICLE_COLOR,
                  f"{VEHICLE_CLASSES[cls]} {conf:.2f}", thickness=3)
 
+    # ── Step 3: plate boxes — green (raw detection) + red (blur region) ───────
     for rect in plate_rects:
         x1, y1, x2, y2 = rect[:4]
-        conf = rect[4] if len(rect) > 4 else None
+        conf  = rect[4] if len(rect) > 4 else None
         label = f"plate {conf:.2f}" if conf is not None else "plate"
-        # Show padded region — identical to what apply_blur will erase
+
+        # Green: raw model detection boundary
+        _dbg_box(vis, x1, y1, x2, y2, _DBG_PLATE_COLOR, label, thickness=2)
+
+        # Red: padded region that was blurred
         px1 = max(0, x1 - blur_padding)
         py1 = max(0, y1 - blur_padding)
         px2 = min(w, x2 + blur_padding)
         py2 = min(h, y2 + blur_padding)
-        _dbg_box(vis, px1, py1, px2, py2, _DBG_PLATE_COLOR, label, thickness=3)
+        cv2.rectangle(vis, (px1, py1), (px2, py2), _DBG_BLUR_COLOR, 4)
 
+    # ── Step 4: own-plate fixed region (orange) ───────────────────────────────
     if own_plate_region:
         ox1, oy1, ox2, oy2 = own_plate_region
         _dbg_box(vis, ox1, oy1, ox2, oy2, _DBG_OWN_COLOR, "own plate", thickness=3)
@@ -552,7 +574,8 @@ def blur_license_plates(
                     if debug:
                         frame = draw_debug_overlay(frame, plates, vehicles,
                                                    own_plate_region=own_plate_region,
-                                                   blur_padding=blur_padding)
+                                                   blur_padding=blur_padding,
+                                                   blur_strength=blur_strength)
                     elif plates:
                         frame = apply_blur(frame, plates, blur_strength=blur_strength,
                                            padding=blur_padding)
