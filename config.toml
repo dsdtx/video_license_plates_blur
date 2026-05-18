@@ -5,7 +5,7 @@
 vehicle_conf = 0.30
 
 # Plate model — minimum confidence for plates detected anywhere on the frame
-plate_conf = 0.15
+plate_conf = 0.45
 
 # Plate model — lower threshold applied only when a plate overlaps a detected
 # vehicle bounding box. Set lower than plate_conf to catch blurry / angled
@@ -27,10 +27,29 @@ overlap = 0.20
 [blur]
 
 # Gaussian blur kernel size — must be odd; larger = stronger blur
-strength = 61
+strength = 91
 
 # Extra pixels added around each detected plate region
 padding = 8
+
+
+# ── Temporal tracking ─────────────────────────────────────────────────────────
+[tracking]
+
+# Set to false to disable tracking entirely and use per-frame detection only
+enabled = true
+
+# How many consecutive frames without a plate detection to fill using prediction.
+# At 30 fps, 8 frames = ~0.27 s. Increase for faster-moving vehicles.
+max_gap_frames = 8
+
+# How many past detections to use when estimating plate velocity.
+# More = smoother prediction but slower to adapt to direction changes.
+history_frames = 15
+
+# Minimum vehicle detection confidence to start/maintain a track.
+# Lower = track more vehicles but risk false tracks.
+min_vehicle_conf = 0.60
 
 
 # ── Output / encoding ─────────────────────────────────────────────────────────

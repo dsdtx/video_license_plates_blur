@@ -415,8 +415,197 @@ def estimate_frame_count(info, start_sec, end_sec):
     return max(1, int((clip_end - clip_start) * info["fps"]))
 
 
+# ─── Temporal tracker ────────────────────────────────────────────────────────
+
+class PlateHistory:
+    """
+    Rolling history of confirmed plate detections for one tracked vehicle.
+    Provides velocity-based position prediction for gap frames.
+    """
+
+    def __init__(self, max_history: int = 15):
+        self._data: list = []          # (frame_idx, cx, cy, w, h, conf)
+        self.max_history = max_history
+        self.miss_count  = 0           # consecutive frames without a detection
+
+    @property
+    def has_history(self) -> bool:
+        return len(self._data) > 0
+
+    def record(self, frame_idx: int, x1, y1, x2, y2, conf: float):
+        cx = (x1 + x2) * 0.5
+        cy = (y1 + y2) * 0.5
+        w  = float(x2 - x1)
+        h  = float(y2 - y1)
+        self._data.append((frame_idx, cx, cy, w, h, conf))
+        if len(self._data) > self.max_history:
+            self._data.pop(0)
+        self.miss_count = 0
+
+    def predict_rect(self, frame_idx: int):
+        """
+        Return (x1, y1, x2, y2) predicted at frame_idx.
+
+        Velocity is computed as an exponentially-weighted average of
+        per-frame deltas so recent movement dominates.  The box expands
+        by 2 px per missed frame to account for growing uncertainty.
+        Returns None if no history exists.
+        """
+        if not self._data:
+            return None
+
+        _, cx_last, cy_last, w_last, h_last, _ = self._data[-1]
+        f_last = self._data[-1][0]
+
+        if len(self._data) >= 2:
+            vxs, vys, weights = [], [], []
+            for i in range(1, len(self._data)):
+                f0, cx0, cy0 = self._data[i-1][0], self._data[i-1][1], self._data[i-1][2]
+                f1, cx1, cy1 = self._data[i][0],   self._data[i][1],   self._data[i][2]
+                dt = f1 - f0
+                if dt > 0:
+                    vxs.append((cx1 - cx0) / dt)
+                    vys.append((cy1 - cy0) / dt)
+                    weights.append(2.0 ** i)        # exponential: recent frames dominate
+            if vxs:
+                tw = sum(weights)
+                vx = sum(v * w for v, w in zip(vxs, weights)) / tw
+                vy = sum(v * w for v, w in zip(vys, weights)) / tw
+                dt = frame_idx - f_last
+                cx_last = cx_last + vx * dt
+                cy_last = cy_last + vy * dt
+
+        expand = self.miss_count * 2          # grow box 2 px per missed frame
+        x1 = int(cx_last - w_last * 0.5 - expand)
+        y1 = int(cy_last - h_last * 0.5 - expand)
+        x2 = int(cx_last + w_last * 0.5 + expand)
+        y2 = int(cy_last + h_last * 0.5 + expand)
+        return (x1, y1, x2, y2)
+
+
+class VehicleTrack:
+    """One tracked vehicle with its associated plate history."""
+    _id_counter = 0
+
+    def __init__(self, box: tuple, frame_idx: int, history_frames: int = 15):
+        VehicleTrack._id_counter += 1
+        self.id         = VehicleTrack._id_counter
+        self.box        = box           # (x1, y1, x2, y2) full-res
+        self.last_frame = frame_idx
+        self.miss_count = 0
+        self.plate      = PlateHistory(max_history=history_frames)
+
+    def update_box(self, box: tuple, frame_idx: int):
+        self.box        = box
+        self.last_frame = frame_idx
+        self.miss_count = 0
+
+    def mark_missed(self):
+        self.miss_count += 1
+
+
+class SceneTracker:
+    """
+    Frame-level coordinator for all vehicle tracks.
+
+    Each call to update() performs:
+      1. IoU-based greedy matching of incoming vehicle detections to existing tracks.
+      2. Plate history update for matched tracks that have a plate inside them.
+      3. Gap-filling: for tracks where no plate was detected but recent history
+         exists, a predicted position is injected with conf=-1 so downstream
+         code can distinguish predicted from detected regions.
+    """
+
+    def __init__(self, max_gap_frames: int = 8, history_frames: int = 15,
+                 min_vehicle_conf: float = 0.60, vehicle_iou_thresh: float = 0.30):
+        self.tracks:            list[VehicleTrack] = []
+        self.max_gap_frames     = max_gap_frames
+        self.history_frames     = history_frames
+        self.min_vehicle_conf   = min_vehicle_conf
+        self.vehicle_iou_thresh = vehicle_iou_thresh
+        self.frame_idx          = 0
+
+    # ── internal matching ─────────────────────────────────────────────────────
+
+    def _match(self, boxes: list):
+        """
+        Greedy IoU matching between current detections and live tracks.
+        Returns (matched_pairs, new_box_indices, lost_track_indices).
+        """
+        if not self.tracks or not boxes:
+            return [], list(range(len(boxes))), list(range(len(self.tracks)))
+
+        pairs = []
+        for ti, track in enumerate(self.tracks):
+            for bi, box in enumerate(boxes):
+                score = iou(track.box, box)
+                if score >= self.vehicle_iou_thresh:
+                    pairs.append((score, ti, bi))
+        pairs.sort(reverse=True)
+
+        matched_t, matched_b, matched = set(), set(), []
+        for score, ti, bi in pairs:
+            if ti not in matched_t and bi not in matched_b:
+                matched.append((ti, bi))
+                matched_t.add(ti)
+                matched_b.add(bi)
+
+        new_boxes   = [i for i in range(len(boxes))       if i not in matched_b]
+        lost_tracks = [i for i in range(len(self.tracks)) if i not in matched_t]
+        return matched, new_boxes, lost_tracks
+
+    # ── public API ────────────────────────────────────────────────────────────
+
+    def update(self, all_vehicles: list, plate_rects: list) -> list:
+        """
+        all_vehicles : [(cls, x1, y1, x2, y2, conf), ...]
+        plate_rects  : [(x1, y1, x2, y2, conf), ...]  — current frame detections
+
+        Returns effective plate list: detected plates + predicted plates.
+        Predicted entries carry conf = -1.0 so debug overlay can label them.
+        """
+        high_conf = [(v[1], v[2], v[3], v[4])
+                     for v in all_vehicles if v[5] >= self.min_vehicle_conf]
+
+        matched, new_boxes, lost_tracks = self._match(high_conf)
+
+        for ti, bi in matched:
+            self.tracks[ti].update_box(high_conf[bi], self.frame_idx)
+        for bi in new_boxes:
+            self.tracks.append(VehicleTrack(high_conf[bi], self.frame_idx,
+                                            self.history_frames))
+        for ti in lost_tracks:
+            self.tracks[ti].mark_missed()
+
+        # Drop tracks that have lost the vehicle for >5 frames
+        self.tracks = [t for t in self.tracks if t.miss_count <= 5]
+
+        effective = list(plate_rects)
+
+        for track in self.tracks:
+            plates_in = [p for p in plate_rects if _overlaps(p[:4], track.box)]
+
+            if plates_in:
+                best = max(plates_in, key=lambda p: p[4] if len(p) > 4 else 1.0)
+                track.plate.record(self.frame_idx, *best[:4],
+                                   best[4] if len(best) > 4 else 1.0)
+            else:
+                track.plate.miss_count += 1
+                if 1 <= track.plate.miss_count <= self.max_gap_frames \
+                        and track.plate.has_history:
+                    predicted = track.plate.predict_rect(self.frame_idx)
+                    if predicted is not None:
+                        effective.append((*predicted, -1.0))  # conf=-1 = predicted
+
+        self.frame_idx += 1
+        return effective
+
+
+# ─── Debug overlay colours ───────────────────────────────────────────────────
+
 _DBG_VEHICLE_COLOR = (255, 100,   0)   # blue
 _DBG_PLATE_COLOR   = (  0, 220,   0)   # green  — raw model detection
+_DBG_PREDICT_COLOR = (  0, 220, 220)   # yellow — tracker-predicted (gap fill)
 _DBG_BLUR_COLOR    = (  0,   0, 220)   # red    — padded blur region
 _DBG_OWN_COLOR     = (  0, 140, 255)   # orange — own plate fixed region
 _DBG_FONT          = cv2.FONT_HERSHEY_SIMPLEX
@@ -455,14 +644,20 @@ def draw_debug_overlay(frame, plate_rects, all_vehicles, own_plate_region=None,
         _dbg_box(vis, x1, y1, x2, y2, _DBG_VEHICLE_COLOR,
                  f"{VEHICLE_CLASSES[cls]} {conf:.2f}", thickness=3)
 
-    # ── Step 3: plate boxes — green (raw detection) + red (blur region) ───────
+    # ── Step 3: plate boxes — green (detected), yellow (predicted), red (blur) ─
     for rect in plate_rects:
         x1, y1, x2, y2 = rect[:4]
-        conf  = rect[4] if len(rect) > 4 else None
-        label = f"plate {conf:.2f}" if conf is not None else "plate"
+        conf = rect[4] if len(rect) > 4 else None
 
-        # Green: raw model detection boundary
-        _dbg_box(vis, x1, y1, x2, y2, _DBG_PLATE_COLOR, label, thickness=2)
+        if conf is not None and conf < 0:      # tracker-predicted gap fill
+            color = _DBG_PREDICT_COLOR
+            label = "predicted"
+        else:
+            color = _DBG_PLATE_COLOR
+            label = f"plate {conf:.2f}" if conf is not None else "plate"
+
+        # Colour-coded boundary
+        _dbg_box(vis, x1, y1, x2, y2, color, label, thickness=2)
 
         # Red: padded region that was blurred
         px1 = max(0, x1 - blur_padding)
@@ -496,6 +691,10 @@ def blur_license_plates(
     preset: str = "medium",
     tmp_dir: str = "D:/pip-tmp",
     debug: bool = False,
+    tracking_enabled: bool = True,
+    max_gap_frames: int = 8,
+    history_frames: int = 15,
+    min_vehicle_conf: float = 0.60,
 ):
     print(f"\n{'='*60}")
     print(f"  License Plate Blurring Tool")
@@ -510,7 +709,9 @@ def blur_license_plates(
     if own_plate_region:
         print(f"  Own plate region (always blurred): {own_plate_region}")
     if debug:
-        print(f"  Mode  : DEBUG (boxes drawn, no blurring)")
+        print(f"  Mode  : DEBUG (blur applied + detection overlay)")
+    if tracking_enabled:
+        print(f"  Track : enabled  (gap={max_gap_frames} frames, history={history_frames})")
     print(f"{'='*60}\n")
 
     info = get_video_info(input_path)
@@ -522,6 +723,12 @@ def blur_license_plates(
         plate_conf=min(plate_conf, plate_conf_in_vehicle)
     )
     print(f"  Models ready  |  vehicle detector + license plate detector\n")
+
+    tracker = SceneTracker(
+        max_gap_frames=max_gap_frames,
+        history_frames=history_frames,
+        min_vehicle_conf=min_vehicle_conf,
+    ) if tracking_enabled else None
 
     frame_size     = width * height * 3
     total_frames   = estimate_frame_count(info, start_time, end_time)
@@ -563,6 +770,9 @@ def blur_license_plates(
                         sahi_slice_size=sahi_slice_size,
                         sahi_overlap=sahi_overlap,
                     )
+
+                    if tracker is not None:
+                        plates = tracker.update(vehicles, plates)
 
                     # Always include own-plate region
                     if own_plate_region:
@@ -616,6 +826,7 @@ def main():
     sahi = cfg["sahi"]
     blr = cfg["blur"]
     out = cfg["output"]
+    trk = cfg.get("tracking", {})
 
     parser = argparse.ArgumentParser(
         description="Blur license plates in video with zero quality loss.",
@@ -690,6 +901,10 @@ Examples:
         preset=out["preset"],
         tmp_dir=out["tmp_dir"],
         debug=args.debug,
+        tracking_enabled=bool(trk.get("enabled", True)),
+        max_gap_frames=int(trk.get("max_gap_frames", 8)),
+        history_frames=int(trk.get("history_frames", 15)),
+        min_vehicle_conf=float(trk.get("min_vehicle_conf", 0.60)),
     )
 
 
