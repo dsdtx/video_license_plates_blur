@@ -149,7 +149,8 @@ def _overlaps(a, b):
 
 def detect_plates(frame, vehicle_model, plate_model, device="cpu", vehicle_conf=0.3,
                   vehicle_filter="all", plate_conf=0.15, plate_conf_in_vehicle=0.07,
-                  sahi_slice_size=640, sahi_overlap=0.2):
+                  sahi_slice_size=640, sahi_overlap=0.2,
+                  standalone_min_ar=1.2, standalone_max_ar=6.0):
     """
     Returns (plate_rects, all_vehicles) where:
       plate_rects  — list of (x1, y1, x2, y2, conf) regions to blur
@@ -214,6 +215,14 @@ def detect_plates(frame, vehicle_model, plate_model, device="cpu", vehicle_conf=
         required = plate_conf_in_vehicle if in_vehicle else plate_conf
         if conf < required:
             continue
+
+        if not in_vehicle:
+            det_w = x2 - x1
+            det_h = y2 - y1
+            if det_h > 0:
+                ar = det_w / det_h
+                if ar < standalone_min_ar or ar > standalone_max_ar:
+                    continue
 
         plate_rects.append((x1, y1, x2, y2, conf))
 
@@ -695,6 +704,8 @@ def blur_license_plates(
     max_gap_frames: int = 8,
     history_frames: int = 15,
     min_vehicle_conf: float = 0.60,
+    standalone_min_ar: float = 1.2,
+    standalone_max_ar: float = 6.0,
 ):
     print(f"\n{'='*60}")
     print(f"  License Plate Blurring Tool")
@@ -769,6 +780,8 @@ def blur_license_plates(
                         plate_conf_in_vehicle=plate_conf_in_vehicle,
                         sahi_slice_size=sahi_slice_size,
                         sahi_overlap=sahi_overlap,
+                        standalone_min_ar=standalone_min_ar,
+                        standalone_max_ar=standalone_max_ar,
                     )
 
                     if tracker is not None:
@@ -905,6 +918,8 @@ Examples:
         max_gap_frames=int(trk.get("max_gap_frames", 8)),
         history_frames=int(trk.get("history_frames", 15)),
         min_vehicle_conf=float(trk.get("min_vehicle_conf", 0.60)),
+        standalone_min_ar=float(det.get("standalone_min_ar", 1.2)),
+        standalone_max_ar=float(det.get("standalone_max_ar", 6.0)),
     )
 
 

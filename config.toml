@@ -12,6 +12,13 @@ plate_conf = 0.45
 # plates on fast-moving vehicles (e.g. motorbikes on the Autobahn).
 plate_conf_in_vehicle = 0.10
 
+# Aspect-ratio (width / height) limits for plates detected outside any vehicle
+# bounding box. Real plates are always wider than tall; anything outside this
+# range is almost certainly a false positive (signs, door numbers, logos, etc.).
+# Plates inside vehicle boxes are never filtered by this rule.
+standalone_min_ar = 1.2
+standalone_max_ar = 6.0
+
 
 # ── SAHI sliced inference ──────────────────────────────────────────────────────
 [sahi]
