@@ -149,8 +149,7 @@ def _overlaps(a, b):
 
 def detect_plates(frame, vehicle_model, plate_model, device="cpu", vehicle_conf=0.3,
                   vehicle_filter="all", plate_conf=0.15, plate_conf_in_vehicle=0.07,
-                  sahi_slice_size=640, sahi_overlap=0.2,
-                  standalone_min_ar=1.2, standalone_max_ar=6.0):
+                  sahi_slice_size=640, sahi_overlap=0.2):
     """
     Returns (plate_rects, all_vehicles) where:
       plate_rects  — list of (x1, y1, x2, y2, conf) regions to blur
@@ -215,14 +214,6 @@ def detect_plates(frame, vehicle_model, plate_model, device="cpu", vehicle_conf=
         required = plate_conf_in_vehicle if in_vehicle else plate_conf
         if conf < required:
             continue
-
-        if not in_vehicle:
-            det_w = x2 - x1
-            det_h = y2 - y1
-            if det_h > 0:
-                ar = det_w / det_h
-                if ar < standalone_min_ar or ar > standalone_max_ar:
-                    continue
 
         plate_rects.append((x1, y1, x2, y2, conf))
 
@@ -526,12 +517,15 @@ class SceneTracker:
     """
 
     def __init__(self, max_gap_frames: int = 8, history_frames: int = 15,
-                 min_vehicle_conf: float = 0.60, vehicle_iou_thresh: float = 0.30):
+                 min_vehicle_conf: float = 0.60, vehicle_iou_thresh: float = 0.30,
+                 standalone_min_ar: float = 1.2, standalone_max_ar: float = 6.0):
         self.tracks:            list[VehicleTrack] = []
         self.max_gap_frames     = max_gap_frames
         self.history_frames     = history_frames
         self.min_vehicle_conf   = min_vehicle_conf
         self.vehicle_iou_thresh = vehicle_iou_thresh
+        self.standalone_min_ar  = standalone_min_ar
+        self.standalone_max_ar  = standalone_max_ar
         self.frame_idx          = 0
 
     # ── internal matching ─────────────────────────────────────────────────────
@@ -575,6 +569,21 @@ class SceneTracker:
         """
         high_conf = [(v[1], v[2], v[3], v[4])
                      for v in all_vehicles if v[5] >= self.min_vehicle_conf]
+
+        # Vehicle zones = current frame detections + last-known positions of live tracks.
+        # A plate overlapping either zone is never considered standalone for AR purposes.
+        vehicle_zones = [(v[1], v[2], v[3], v[4]) for v in all_vehicles] + \
+                        [t.box for t in self.tracks]
+        filtered = []
+        for p in plate_rects:
+            if any(_overlaps(p[:4], z) for z in vehicle_zones):
+                filtered.append(p)
+            else:
+                x1, y1, x2, y2 = p[:4]
+                h = y2 - y1
+                if h > 0 and self.standalone_min_ar <= (x2 - x1) / h <= self.standalone_max_ar:
+                    filtered.append(p)
+        plate_rects = filtered
 
         matched, new_boxes, lost_tracks = self._match(high_conf)
 
@@ -739,6 +748,8 @@ def blur_license_plates(
         max_gap_frames=max_gap_frames,
         history_frames=history_frames,
         min_vehicle_conf=min_vehicle_conf,
+        standalone_min_ar=standalone_min_ar,
+        standalone_max_ar=standalone_max_ar,
     ) if tracking_enabled else None
 
     frame_size     = width * height * 3
@@ -780,12 +791,22 @@ def blur_license_plates(
                         plate_conf_in_vehicle=plate_conf_in_vehicle,
                         sahi_slice_size=sahi_slice_size,
                         sahi_overlap=sahi_overlap,
-                        standalone_min_ar=standalone_min_ar,
-                        standalone_max_ar=standalone_max_ar,
                     )
 
                     if tracker is not None:
                         plates = tracker.update(vehicles, plates)
+                    else:
+                        vehicle_zones = [(v[1], v[2], v[3], v[4]) for v in vehicles]
+                        ar_filtered = []
+                        for p in plates:
+                            if any(_overlaps(p[:4], z) for z in vehicle_zones):
+                                ar_filtered.append(p)
+                            else:
+                                x1, y1, x2, y2 = p[:4]
+                                h = y2 - y1
+                                if h > 0 and standalone_min_ar <= (x2-x1)/h <= standalone_max_ar:
+                                    ar_filtered.append(p)
+                        plates = ar_filtered
 
                     # Always include own-plate region
                     if own_plate_region:
