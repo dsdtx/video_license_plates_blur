@@ -489,16 +489,18 @@ class VehicleTrack:
 
     def __init__(self, box: tuple, frame_idx: int, history_frames: int = 15):
         VehicleTrack._id_counter += 1
-        self.id         = VehicleTrack._id_counter
-        self.box        = box           # (x1, y1, x2, y2) full-res
-        self.last_frame = frame_idx
-        self.miss_count = 0
-        self.plate      = PlateHistory(max_history=history_frames)
+        self.id          = VehicleTrack._id_counter
+        self.box         = box           # (x1, y1, x2, y2) full-res
+        self.last_frame  = frame_idx
+        self.miss_count  = 0
+        self.frames_seen = 1             # frames vehicle was successfully detected
+        self.plate       = PlateHistory(max_history=history_frames)
 
     def update_box(self, box: tuple, frame_idx: int):
-        self.box        = box
-        self.last_frame = frame_idx
-        self.miss_count = 0
+        self.box         = box
+        self.last_frame  = frame_idx
+        self.miss_count  = 0
+        self.frames_seen += 1
 
     def mark_missed(self):
         self.miss_count += 1
@@ -622,6 +624,7 @@ class SceneTracker:
 # ─── Debug overlay colours ───────────────────────────────────────────────────
 
 _DBG_VEHICLE_COLOR = (255, 100,   0)   # blue
+_DBG_GHOST_COLOR   = (180,  80,  80)   # dim teal — tracked vehicle, detector missed
 _DBG_PLATE_COLOR   = (  0, 220,   0)   # green  — raw model detection
 _DBG_PREDICT_COLOR = (  0, 220, 220)   # yellow — tracker-predicted (gap fill)
 _DBG_BLUR_COLOR    = (  0,   0, 220)   # red    — padded blur region
@@ -638,14 +641,16 @@ def _dbg_box(img, x1, y1, x2, y2, color, label, thickness=3):
 
 
 def draw_debug_overlay(frame, plate_rects, all_vehicles, own_plate_region=None,
-                       blur_padding=8, blur_strength=61):
+                       blur_padding=8, blur_strength=61, tracker=None):
     """
     Returns a debug frame that shows exactly what the production output will look like:
       - Blur is applied to all detected regions (identical to production)
-      - Green box  = raw model detection boundary
-      - Red box    = padded blur region (what was actually erased)
-      - Blue box   = vehicle detection
-      - Orange box = own-plate fixed region
+      - Blue box     = vehicle detection  (label: class conf | #id Nf detected)
+      - Teal box     = tracked vehicle whose detector dropped this frame (label: gap N/M)
+      - Green box    = raw plate detection boundary
+      - Yellow box   = tracker-predicted plate (gap fill)
+      - Red box      = padded blur region (what was actually erased)
+      - Orange box   = own-plate fixed region
     """
     h, w = frame.shape[:2]
     vis = frame.copy()
@@ -657,10 +662,38 @@ def draw_debug_overlay(frame, plate_rects, all_vehicles, own_plate_region=None,
     if all_rects:
         vis = apply_blur(vis, all_rects, blur_strength=blur_strength, padding=blur_padding)
 
-    # ── Step 2: vehicle boxes (blue) ──────────────────────────────────────────
-    for (cls, x1, y1, x2, y2, conf) in all_vehicles:
-        _dbg_box(vis, x1, y1, x2, y2, _DBG_VEHICLE_COLOR,
-                 f"{VEHICLE_CLASSES[cls]} {conf:.2f}", thickness=3)
+    # ── Step 2: build a lookup of track data keyed by closest vehicle box ─────
+    # Maps each track to its detected vehicle (if any) so we can annotate labels.
+    track_by_vehicle = {}   # index into all_vehicles → VehicleTrack
+    ghost_tracks     = []   # tracks whose vehicle wasn't detected this frame
+    if tracker is not None:
+        for track in tracker.tracks:
+            if track.miss_count == 0:
+                # Find the all_vehicles entry closest to this track's box
+                best_vi, best_iou = None, 0.0
+                for vi, (_, vx1, vy1, vx2, vy2, _) in enumerate(all_vehicles):
+                    score = iou(track.box, (vx1, vy1, vx2, vy2))
+                    if score > best_iou:
+                        best_iou, best_vi = score, vi
+                if best_vi is not None and best_iou > 0.1:
+                    track_by_vehicle[best_vi] = track
+            else:
+                ghost_tracks.append(track)
+
+    # ── Step 3: detected vehicle boxes (blue) ────────────────────────────────
+    for vi, (cls, x1, y1, x2, y2, conf) in enumerate(all_vehicles):
+        track = track_by_vehicle.get(vi)
+        if track:
+            label = f"{VEHICLE_CLASSES[cls]} {conf:.2f} | #{track.id} {track.frames_seen}f"
+        else:
+            label = f"{VEHICLE_CLASSES[cls]} {conf:.2f}"
+        _dbg_box(vis, x1, y1, x2, y2, _DBG_VEHICLE_COLOR, label, thickness=3)
+
+    # ── Step 4: ghost vehicle boxes — tracked but not detected this frame ─────
+    for track in ghost_tracks:
+        x1, y1, x2, y2 = track.box
+        label = f"#{track.id} gap {track.miss_count}/{tracker.max_gap_frames} | {track.frames_seen}f"
+        _dbg_box(vis, x1, y1, x2, y2, _DBG_GHOST_COLOR, label, thickness=2)
 
     # ── Step 3: plate boxes — green (detected), yellow (predicted), red (blur) ─
     for rect in plate_rects:
@@ -819,7 +852,8 @@ def blur_license_plates(
                         frame = draw_debug_overlay(frame, plates, vehicles,
                                                    own_plate_region=own_plate_region,
                                                    blur_padding=blur_padding,
-                                                   blur_strength=blur_strength)
+                                                   blur_strength=blur_strength,
+                                                   tracker=tracker)
                     elif plates:
                         frame = apply_blur(frame, plates, blur_strength=blur_strength,
                                            padding=blur_padding)
