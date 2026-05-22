@@ -217,10 +217,8 @@ def detect_plates(frame, vehicle_model, plate_model, device="cpu", vehicle_conf=
 
         plate_rects.append((x1, y1, x2, y2, conf))
 
-    # ── Step 4: dedup and one-plate-per-vehicle ──────────────────────────────
-    plate_rects = merge_overlapping(plate_rects)
-    plate_rects = suppress_duplicate_plates(plate_rects, filter_boxes)
-    return plate_rects, all_vehicles
+    # ── Step 4: dedup ─────────────────────────────────────────────────────────
+    return merge_overlapping(plate_rects), all_vehicles
 
 
 def suppress_duplicate_plates(plate_rects, vehicle_boxes):
@@ -230,21 +228,26 @@ def suppress_duplicate_plates(plate_rects, vehicle_boxes):
     offset detections that survive IoU-NMS. This enforces the physical
     constraint that only one plate face is visible per vehicle at a time.
     Plates not inside any vehicle box are passed through unchanged.
+
+    Returns (kept, suppressed) so callers can visualise the dropped detections.
     """
     if not vehicle_boxes or not plate_rects:
-        return plate_rects
-    claimed = [False] * len(plate_rects)
-    result  = []
+        return plate_rects, []
+    claimed    = [False] * len(plate_rects)
+    kept       = []
+    suppressed = []
     for vb in vehicle_boxes:
         inside = [(i, p) for i, p in enumerate(plate_rects)
                   if not claimed[i] and _overlaps(p[:4], vb)]
         if inside:
             best_i, best_p = max(inside, key=lambda ip: ip[1][4] if len(ip[1]) > 4 else 1.0)
-            result.append(best_p)
-            for i, _ in inside:
+            kept.append(best_p)
+            for i, p in inside:
                 claimed[i] = True
-    result.extend(p for i, p in enumerate(plate_rects) if not claimed[i])
-    return result
+                if i != best_i:
+                    suppressed.append(p)
+    kept.extend(p for i, p in enumerate(plate_rects) if not claimed[i])
+    return kept, suppressed
 
 
 def merge_overlapping(rects, iou_thresh=0.3):
@@ -650,8 +653,9 @@ class SceneTracker:
 # ─── Debug overlay colours ───────────────────────────────────────────────────
 
 _DBG_VEHICLE_COLOR = (255, 100,   0)   # blue
-_DBG_GHOST_COLOR   = (180,  80,  80)   # dim teal — tracked vehicle, detector missed
-_DBG_PLATE_COLOR   = (  0, 220,   0)   # green  — raw model detection
+_DBG_GHOST_COLOR      = (180,  80,  80)   # dim teal — tracked vehicle, detector missed
+_DBG_SUPPRESSED_COLOR = (120, 120, 120)   # grey    — duplicate plate, suppressed
+_DBG_PLATE_COLOR      = (  0, 220,   0)   # green  — raw model detection
 _DBG_PREDICT_COLOR = (  0, 220, 220)   # yellow — tracker-predicted (gap fill)
 _DBG_BLUR_COLOR    = (  0,   0, 220)   # red    — padded blur region
 _DBG_OWN_COLOR     = (  0, 140, 255)   # orange — own plate fixed region
@@ -676,7 +680,8 @@ def _dbg_box(img, x1, y1, x2, y2, color, label, thickness=3):
 
 
 def draw_debug_overlay(frame, plate_rects, all_vehicles, own_plate_region=None,
-                       blur_padding=8, blur_strength=61, tracker=None):
+                       blur_padding=8, blur_strength=61, tracker=None,
+                       suppressed_plates=None):
     """
     Returns a debug frame that shows exactly what the production output will look like:
       - Blur is applied to all detected regions (identical to production)
@@ -756,6 +761,13 @@ def draw_debug_overlay(frame, plate_rects, all_vehicles, own_plate_region=None,
     if own_plate_region:
         ox1, oy1, ox2, oy2 = own_plate_region
         _dbg_box(vis, ox1, oy1, ox2, oy2, _DBG_OWN_COLOR, "own plate", thickness=3)
+
+    # ── Step 5: suppressed duplicates (grey, thin) ────────────────────────────
+    for rect in (suppressed_plates or []):
+        x1, y1, x2, y2 = rect[:4]
+        conf  = rect[4] if len(rect) > 4 else None
+        label = f"dup {conf:.2f}" if conf is not None else "dup"
+        _dbg_box(vis, x1, y1, x2, y2, _DBG_SUPPRESSED_COLOR, label, thickness=1)
 
     return vis
 
@@ -861,6 +873,12 @@ def blur_license_plates(
                         sahi_overlap=sahi_overlap,
                     )
 
+                    # One plate per vehicle — done here so debug can show suppressed ones
+                    filter_classes  = VEHICLE_FILTER_MAP.get(vehicle_filter, set(VEHICLE_CLASSES))
+                    vehicle_boxes   = [(v[1], v[2], v[3], v[4]) for v in vehicles
+                                       if v[0] in filter_classes]
+                    plates, suppressed_plates = suppress_duplicate_plates(plates, vehicle_boxes)
+
                     if tracker is not None:
                         plates = tracker.update(vehicles, plates)
                     else:
@@ -888,7 +906,8 @@ def blur_license_plates(
                                                    own_plate_region=own_plate_region,
                                                    blur_padding=blur_padding,
                                                    blur_strength=blur_strength,
-                                                   tracker=tracker)
+                                                   tracker=tracker,
+                                                   suppressed_plates=suppressed_plates)
                     elif plates:
                         frame = apply_blur(frame, plates, blur_strength=blur_strength,
                                            padding=blur_padding)
