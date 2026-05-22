@@ -217,8 +217,34 @@ def detect_plates(frame, vehicle_model, plate_model, device="cpu", vehicle_conf=
 
         plate_rects.append((x1, y1, x2, y2, conf))
 
-    # ── Step 4: dedup ─────────────────────────────────────────────────────────
-    return merge_overlapping(plate_rects), all_vehicles
+    # ── Step 4: dedup and one-plate-per-vehicle ──────────────────────────────
+    plate_rects = merge_overlapping(plate_rects)
+    plate_rects = suppress_duplicate_plates(plate_rects, filter_boxes)
+    return plate_rects, all_vehicles
+
+
+def suppress_duplicate_plates(plate_rects, vehicle_boxes):
+    """Keep only the highest-confidence plate inside each vehicle box.
+
+    SAHI tiles overlap, so the same physical plate can produce 2-3 slightly
+    offset detections that survive IoU-NMS. This enforces the physical
+    constraint that only one plate face is visible per vehicle at a time.
+    Plates not inside any vehicle box are passed through unchanged.
+    """
+    if not vehicle_boxes or not plate_rects:
+        return plate_rects
+    claimed = [False] * len(plate_rects)
+    result  = []
+    for vb in vehicle_boxes:
+        inside = [(i, p) for i, p in enumerate(plate_rects)
+                  if not claimed[i] and _overlaps(p[:4], vb)]
+        if inside:
+            best_i, best_p = max(inside, key=lambda ip: ip[1][4] if len(ip[1]) > 4 else 1.0)
+            result.append(best_p)
+            for i, _ in inside:
+                claimed[i] = True
+    result.extend(p for i, p in enumerate(plate_rects) if not claimed[i])
+    return result
 
 
 def merge_overlapping(rects, iou_thresh=0.3):
@@ -633,11 +659,20 @@ _DBG_FONT          = cv2.FONT_HERSHEY_SIMPLEX
 
 
 def _dbg_box(img, x1, y1, x2, y2, color, label, thickness=3):
+    h_img, w_img = img.shape[:2]
     cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
     fs = max(0.6, (x2 - x1) / 500)
     (tw, th), _ = cv2.getTextSize(label, _DBG_FONT, fs, 2)
-    cv2.rectangle(img, (x1, y1 - th - 8), (x1 + tw + 6, y1), color, -1)
-    cv2.putText(img, label, (x1 + 3, y1 - 4), _DBG_FONT, fs, (255, 255, 255), 2)
+    pad = 6
+    # Flip label below the box when it would clip above the frame top
+    if y1 - th - pad * 2 >= 0:
+        bg_y1, bg_y2, ty = y1 - th - pad * 2, y1, y1 - pad
+    else:
+        bg_y1, bg_y2, ty = y2, y2 + th + pad * 2, y2 + th + pad
+    # Clamp label right edge to frame width
+    lx = min(x1, w_img - tw - pad * 2)
+    cv2.rectangle(img, (lx, bg_y1), (lx + tw + pad * 2, bg_y2), color, -1)
+    cv2.putText(img, label, (lx + pad, ty), _DBG_FONT, fs, (255, 255, 255), 2, cv2.LINE_AA)
 
 
 def draw_debug_overlay(frame, plate_rects, all_vehicles, own_plate_region=None,
@@ -700,9 +735,9 @@ def draw_debug_overlay(frame, plate_rects, all_vehicles, own_plate_region=None,
         x1, y1, x2, y2 = rect[:4]
         conf = rect[4] if len(rect) > 4 else None
 
-        if conf is not None and conf < 0:      # tracker-predicted gap fill
+        if conf is not None and conf < 0:      # tracker gap fill (SAHI missed this frame)
             color = _DBG_PREDICT_COLOR
-            label = "predicted"
+            label = "gap fill"
         else:
             color = _DBG_PLATE_COLOR
             label = f"plate {conf:.2f}" if conf is not None else "plate"
