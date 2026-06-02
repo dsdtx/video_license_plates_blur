@@ -98,7 +98,7 @@ filename in the same directory:
 ```bash
 # From the project root
 curl -L -o license-plate-finetune-v1m.pt \
-  https://github.com/<your-username>/<your-repo>/releases/latest/download/license-plate-finetune-v1m.pt
+  https://github.com/dsdtx/video_license_plates_blur/releases/latest/download/license-plate-finetune-v1m.pt
 ```
 
 If you ever want the baseline HuggingFace model for comparison, it's at
