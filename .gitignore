@@ -2,10 +2,29 @@
 *.pt
 *.onnx
 
+# Python virtualenvs
+.venv/
+venv/
+
 # Debug and output frames
 Debug/
+Debugging frame/
 training_frames/
 runs/
+
+# Training datasets and review state
+training_data/
+training_data_v2/
+
+# Personal config / scratch notes
+notes on configuration.txt
+
+# Social media / marketing tooling (kept local)
+make_instagram_slides.py
+
+# Optional helper scripts not part of the shipped pipeline
+compare_v2.py
+promote_augmented_edits.py
 
 # Video files
 *.mov

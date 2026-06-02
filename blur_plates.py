@@ -15,6 +15,7 @@ Example:
 """
 
 import cv2
+import math
 import numpy as np
 import subprocess
 import json
@@ -24,6 +25,7 @@ import argparse
 import tempfile
 import threading
 import tomllib
+from datetime import datetime
 from tqdm import tqdm
 from sahi import AutoDetectionModel
 from sahi.predict import get_sliced_prediction
@@ -112,7 +114,7 @@ def get_video_info(video_path: str) -> dict:
     }
 
 
-PLATE_MODEL_PATH = os.path.join(os.path.dirname(__file__), "license-plate-finetune-v1n.pt")
+PLATE_MODEL_PATH = os.path.join(os.path.dirname(__file__), "license-plate-finetune-v1m.pt")
 DETECT_WIDTH = 1280  # both models run at this width; coords scaled back to full-res
 
 
@@ -147,9 +149,27 @@ def _overlaps(a, b):
     return a[0] < b[2] and a[2] > b[0] and a[1] < b[3] and a[3] > b[1]
 
 
+def _unsharp_mask(img: np.ndarray, amount: float = 1.5, sigma: float = 1.0) -> np.ndarray:
+    """
+    Sharpen *img* via unsharp masking.
+
+    A Gaussian-blurred copy is subtracted from the original and the
+    difference is added back at *amount* × strength.  Works entirely in
+    uint8 space through OpenCV's addWeighted so there is no float cast.
+
+    amount : 0.5 = subtle,  1.5 = strong,  3.0 = very aggressive
+    sigma  : Gaussian radius in pixels (1.0–2.0 is typical)
+    """
+    blurred = cv2.GaussianBlur(img, (0, 0), sigmaX=sigma)
+    # img*(1+amount) - blurred*amount  ≡ img + amount*(img - blurred)
+    return cv2.addWeighted(img, 1.0 + amount, blurred, -amount, 0)
+
+
 def detect_plates(frame, vehicle_model, plate_model, device="cpu", vehicle_conf=0.3,
                   vehicle_filter="all", plate_conf=0.15, plate_conf_in_vehicle=0.07,
-                  sahi_slice_size=640, sahi_overlap=0.2):
+                  sahi_slice_size=640, sahi_overlap=0.2, detect_scale=1.0,
+                  sharpen=False, sharpen_amount=1.5, sharpen_sigma=1.0,
+                  vehicle_crop_scale=1.0):
     """
     Returns (plate_rects, all_vehicles) where:
       plate_rects  — list of (x1, y1, x2, y2, conf) regions to blur
@@ -160,6 +180,23 @@ def detect_plates(frame, vehicle_model, plate_model, device="cpu", vehicle_conf=
       - Plates outside any vehicle box use plate_conf (stricter).
       This lets you catch blurry / angled plates on motorbikes without flooding
       the full frame with false positives.
+
+    detect_scale:
+      Fraction of the original resolution sent to the plate model (default 1.0).
+      0.5 processes 4K footage at 2K for ~5× faster detection on a compute-bound
+      GPU; blur is always applied at the original full resolution.
+
+    sharpen / sharpen_amount / sharpen_sigma:
+      Apply unsharp masking to the detection frame before SAHI tiling.
+      Helps with lens blur, mild motion blur, or heavily compressed footage.
+
+    vehicle_crop_scale:
+      When > 1.0, each detected vehicle bounding box is extracted from the
+      original full-resolution frame, upscaled by this factor with Lanczos
+      resampling, and fed to the plate model directly.  Plates that were
+      30 px wide become 60–90 px wide, dramatically improving confidence on
+      distant or small vehicles.  Results are merged with the SAHI pass.
+      1.0 = disabled (default).  2.0 is recommended when enabling.
     """
     h, w = frame.shape[:2]
     scale = DETECT_WIDTH / w
@@ -186,10 +223,31 @@ def detect_plates(frame, vehicle_model, plate_model, device="cpu", vehicle_conf=
                     if cls in filter_classes]
 
     # ── Step 2: SAHI sliced plate detection ───────────────────────────────────
+    # Optionally downsample the frame for faster detection (detect_scale < 1.0).
+    # Coordinates are scaled back to full resolution after detection so the blur
+    # is always applied at the original quality.
+    if detect_scale < 1.0:
+        det_w = max(1, int(w * detect_scale))
+        det_h = max(1, int(h * detect_scale))
+        frame_for_det = cv2.resize(frame, (det_w, det_h), interpolation=cv2.INTER_LINEAR)
+        coord_scale   = 1.0 / detect_scale   # multiply detected coords by this
+        # Vehicle filter boxes also need to be in detection-space
+        filter_boxes_det = [(int(x1 * detect_scale), int(y1 * detect_scale),
+                             int(x2 * detect_scale), int(y2 * detect_scale))
+                            for (x1, y1, x2, y2) in filter_boxes]
+    else:
+        frame_for_det    = frame
+        coord_scale      = 1.0
+        filter_boxes_det = filter_boxes
+
+    # Optional: sharpen the detection frame to recover edge contrast on blurry footage
+    if sharpen:
+        frame_for_det = _unsharp_mask(frame_for_det, sharpen_amount, sharpen_sigma)
+
     # Model threshold is pre-set to min(plate_conf, plate_conf_in_vehicle) in
     # load_models() so no valid detection is thrown away before we can filter.
     plate_model.confidence_threshold = min(plate_conf, plate_conf_in_vehicle)
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    frame_rgb = cv2.cvtColor(frame_for_det, cv2.COLOR_BGR2RGB)
     result = get_sliced_prediction(
         frame_rgb, plate_model,
         slice_height=sahi_slice_size, slice_width=sahi_slice_size,
@@ -206,7 +264,7 @@ def detect_plates(frame, vehicle_model, plate_model, device="cpu", vehicle_conf=
             continue
         conf       = det.score.value
         plate      = (x1, y1, x2, y2)
-        in_vehicle = any(_overlaps(plate, vb) for vb in filter_boxes)
+        in_vehicle = any(_overlaps(plate, vb) for vb in filter_boxes_det)
 
         if vehicle_filter != "all" and not in_vehicle:
             continue  # vehicle filter requires vehicle overlap
@@ -215,10 +273,225 @@ def detect_plates(frame, vehicle_model, plate_model, device="cpu", vehicle_conf=
         if conf < required:
             continue
 
-        plate_rects.append((x1, y1, x2, y2, conf))
+        # Scale coords back to full-resolution space
+        plate_rects.append((
+            int(x1 * coord_scale), int(y1 * coord_scale),
+            int(x2 * coord_scale), int(y2 * coord_scale),
+            conf,
+        ))
+
+    # ── Step 3b: per-vehicle crop upscale pass ────────────────────────────────
+    # For each detected vehicle, extract its bounding box from the original
+    # full-res frame, upscale by vehicle_crop_scale, run the plate model on the
+    # larger crop, then map detections back to frame coordinates.
+    # This is highly effective for distant/small plates that SAHI misses because
+    # they are too few pixels wide for the model to score confidently.
+    if vehicle_crop_scale > 1.0:
+        _CROP_PAD = 12   # extra pixels around each vehicle bbox (original-frame px)
+        inv_crop  = 1.0 / vehicle_crop_scale
+        for (cls, vx1, vy1, vx2, vy2, _vc) in all_vehicles:
+            if cls not in filter_classes:
+                continue
+            # Crop coords in original-frame space, clamped to frame edges
+            cx1 = max(0, vx1 - _CROP_PAD)
+            cy1 = max(0, vy1 - _CROP_PAD)
+            cx2 = min(w, vx2 + _CROP_PAD)
+            cy2 = min(h, vy2 + _CROP_PAD)
+            crop = frame[cy1:cy2, cx1:cx2]
+            if crop.size == 0:
+                continue
+
+            # Upscale with Lanczos for sharpest result
+            up_w = max(1, int((cx2 - cx1) * vehicle_crop_scale))
+            up_h = max(1, int((cy2 - cy1) * vehicle_crop_scale))
+            crop_up = cv2.resize(crop, (up_w, up_h), interpolation=cv2.INTER_LANCZOS4)
+
+            # Apply sharpening to the upscaled crop if enabled
+            if sharpen:
+                crop_up = _unsharp_mask(crop_up, sharpen_amount, sharpen_sigma)
+
+            # Run plate model directly on the upscaled crop (no SAHI — crop is
+            # already the right scale; one model call per vehicle)
+            crop_rgb     = cv2.cvtColor(crop_up, cv2.COLOR_BGR2RGB)
+            min_conf_thr = min(plate_conf, plate_conf_in_vehicle)
+            crop_results = plate_model.model(
+                crop_rgb, conf=min_conf_thr, verbose=False
+            )
+
+            for r in crop_results:
+                if r.boxes is None:
+                    continue
+                for box in r.boxes:
+                    c = float(box.conf[0])
+                    if c < plate_conf_in_vehicle:   # all crop plates are "in vehicle"
+                        continue
+                    px1, py1, px2, py2 = map(int, box.xyxy[0].tolist())
+                    # Map from upscaled-crop space → original-frame space
+                    ox1 = cx1 + int(px1 * inv_crop)
+                    oy1 = cy1 + int(py1 * inv_crop)
+                    ox2 = cx1 + int(px2 * inv_crop)
+                    oy2 = cy1 + int(py2 * inv_crop)
+                    if ox2 > ox1 and oy2 > oy1:
+                        plate_rects.append((ox1, oy1, ox2, oy2, c))
 
     # ── Step 4: dedup ─────────────────────────────────────────────────────────
     return merge_overlapping(plate_rects), all_vehicles
+
+
+# ─── Batch / GPU-parallel detection ──────────────────────────────────────────
+
+def auto_batch_size(width: int, height: int, sahi_slice_size: int = 640,
+                    sahi_overlap: float = 0.2) -> int:
+    """
+    Calculate how many frames to batch based on free GPU memory after models
+    have been loaded.  Returns 1 when CUDA is not available (CPU mode).
+
+    Memory estimate per frame:
+        tiles_per_frame × tile_bytes × 4  (activation headroom, float16)
+    """
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return 1
+        free_bytes, _ = torch.cuda.mem_get_info()
+        usable = max(0, free_bytes - 3 * 1024 ** 3)   # keep 3 GB headroom
+
+        stride = int(sahi_slice_size * (1 - sahi_overlap))
+        tiles_per_frame = (
+            math.ceil(width  / stride) *
+            math.ceil(height / stride)
+        )
+        # float16 tile tensor × 4 for intermediate activations
+        bytes_per_frame = tiles_per_frame * sahi_slice_size * sahi_slice_size * 3 * 2 * 4
+
+        batch = max(1, int(usable / bytes_per_frame))
+        return min(batch, 64)          # practical cap: 64 frames at once
+    except Exception:
+        return 1
+
+
+def detect_plates_batched(frames, vehicle_model, plate_model, device,
+                          vehicle_conf=0.3, vehicle_filter="all",
+                          plate_conf=0.45, plate_conf_in_vehicle=0.10,
+                          sahi_slice_size=640, sahi_overlap=0.2):
+    """
+    GPU-efficient alternative to calling detect_plates() per frame.
+
+    Strategy:
+      1. One batched vehicle-detection call for all N frames.
+      2. All SAHI tiles from all N frames are pooled and sent to the plate
+         model in a single GPU inference call — far fewer kernel launches.
+      3. Tile coordinates are mapped back to full-frame space per-frame.
+      4. The same context-aware confidence filtering and NMS used in
+         detect_plates() is applied, so results are equivalent.
+
+    Falls back to single-frame detect_plates() when len(frames) == 1.
+    """
+    if len(frames) == 1:
+        r, v = detect_plates(
+            frames[0], vehicle_model, plate_model, device,
+            vehicle_conf=vehicle_conf, vehicle_filter=vehicle_filter,
+            plate_conf=plate_conf, plate_conf_in_vehicle=plate_conf_in_vehicle,
+            sahi_slice_size=sahi_slice_size, sahi_overlap=sahi_overlap,
+        )
+        return [(r, v)]
+
+    h, w = frames[0].shape[:2]
+    scale  = DETECT_WIDTH / w
+    inv    = 1.0 / scale
+    filter_classes = VEHICLE_FILTER_MAP.get(vehicle_filter, set(VEHICLE_CLASSES))
+    min_conf = min(plate_conf, plate_conf_in_vehicle)
+
+    # ── 1. Batch vehicle detection (one GPU call for all N frames) ─────────────
+    smalls = [cv2.resize(f, (DETECT_WIDTH, int(h * scale)),
+                         interpolation=cv2.INTER_LINEAR) for f in frames]
+    batch_v = vehicle_model(smalls, conf=vehicle_conf, verbose=False)
+
+    per_frame_vehicles = []
+    for r in batch_v:
+        vehicles = []
+        if r.boxes is not None:
+            for box in r.boxes:
+                cls = int(box.cls[0])
+                if cls not in VEHICLE_CLASSES:
+                    continue
+                vx1, vy1, vx2, vy2 = map(int, box.xyxy[0].tolist())
+                conf_v = float(box.conf[0])
+                vehicles.append((cls, int(vx1 * inv), int(vy1 * inv),
+                                  int(vx2 * inv), int(vy2 * inv), conf_v))
+        per_frame_vehicles.append(vehicles)
+
+    # ── 2. Pool SAHI tiles from all frames into one list ──────────────────────
+    stride     = int(sahi_slice_size * (1 - sahi_overlap))
+    all_tiles  = []   # flat list of tile ndarrays (RGB, padded to sahi_slice_size²)
+    tile_meta  = []   # (frame_idx, origin_x, origin_y, actual_w, actual_h)
+
+    for fi, frame in enumerate(frames):
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        fh, fw = rgb.shape[:2]
+        y = 0
+        while True:
+            y2 = min(y + sahi_slice_size, fh)
+            x = 0
+            while True:
+                x2 = min(x + sahi_slice_size, fw)
+                actual_w, actual_h = x2 - x, y2 - y
+                tile = rgb[y:y2, x:x2]
+                if actual_h < sahi_slice_size or actual_w < sahi_slice_size:
+                    pad = np.zeros((sahi_slice_size, sahi_slice_size, 3), dtype=np.uint8)
+                    pad[:actual_h, :actual_w] = tile
+                    tile = pad
+                all_tiles.append(tile)
+                tile_meta.append((fi, x, y, actual_w, actual_h))
+                if x2 >= fw:
+                    break
+                x += stride
+            if y2 >= fh:
+                break
+            y += stride
+
+    # ── 3. Single batched plate inference on all tiles ────────────────────────
+    tile_results = plate_model.model(
+        all_tiles, conf=min_conf, verbose=False, imgsz=sahi_slice_size,
+    )
+
+    # ── 4. Map tile detections back to full-frame coordinates ─────────────────
+    per_frame_raw = [[] for _ in frames]
+    for tile_r, (fi, ox, oy, tw, th) in zip(tile_results, tile_meta):
+        if tile_r.boxes is None:
+            continue
+        for box in tile_r.boxes:
+            bx1, by1, bx2, by2 = map(int, box.xyxy[0].tolist())
+            # clamp to the unpadded tile area
+            bx1, bx2 = min(bx1, tw), min(bx2, tw)
+            by1, by2 = min(by1, th), min(by2, th)
+            if bx2 <= bx1 or by2 <= by1:
+                continue
+            per_frame_raw[fi].append(
+                (ox + bx1, oy + by1, ox + bx2, oy + by2, float(box.conf[0]))
+            )
+
+    # ── 5. Context-aware filtering + NMS, per frame ───────────────────────────
+    results = []
+    for fi, all_vehicles in enumerate(per_frame_vehicles):
+        filter_boxes = [
+            (x1, y1, x2, y2)
+            for (cls, x1, y1, x2, y2, _) in all_vehicles
+            if cls in filter_classes
+        ]
+        plate_rects = []
+        for (x1, y1, x2, y2, conf_val) in per_frame_raw[fi]:
+            plate     = (x1, y1, x2, y2)
+            in_vehicle = any(_overlaps(plate, vb) for vb in filter_boxes)
+            if vehicle_filter != "all" and not in_vehicle:
+                continue
+            required = plate_conf_in_vehicle if in_vehicle else plate_conf
+            if conf_val < required:
+                continue
+            plate_rects.append((x1, y1, x2, y2, conf_val))
+        results.append((merge_overlapping(plate_rects), all_vehicles))
+
+    return results
 
 
 def suppress_duplicate_plates(plate_rects, vehicle_boxes):
@@ -299,19 +572,46 @@ def apply_blur(frame, rects, blur_strength=61, padding=8):
     return frame
 
 
-def build_ffmpeg_extract(input_path, start_sec, end_sec):
-    """Build ffmpeg command that pipes raw BGR frames to stdout."""
+_CUVID_DECODERS = {
+    "h264": "h264_cuvid",
+    "hevc": "hevc_cuvid",
+    "av1":  "av1_cuvid",
+    "vp9":  "vp9_cuvid",
+}
+
+
+def build_ffmpeg_extract(input_path, start_sec, end_sec, codec=None):
+    """Build ffmpeg command that pipes raw BGR frames to stdout.
+
+    Uses NVIDIA CUVID hardware decode when the input codec is supported,
+    falling back to software decode silently.
+    """
     cmd = ["ffmpeg", "-y"]
-    if start_sec is not None:
-        cmd += ["-ss", f"{start_sec:.6f}"]
-    cmd += ["-i", input_path]
+
+    hw_decoder = _CUVID_DECODERS.get(codec or "")
+    if hw_decoder:
+        # CUVID decoder must come before -i; seek with -ss after -i for accuracy
+        cmd += ["-c:v", hw_decoder]
+        cmd += ["-i", input_path]
+        if start_sec is not None:
+            cmd += ["-ss", f"{start_sec:.6f}"]
+    else:
+        if start_sec is not None:
+            cmd += ["-ss", f"{start_sec:.6f}"]
+        cmd += ["-i", input_path]
+
     if end_sec is not None:
         duration = end_sec - (start_sec or 0.0)
         cmd += ["-t", f"{duration:.6f}"]
+
+    # CUVID decoders output nv12 and sometimes emit wrong color-range metadata,
+    # causing orange-cast corruption when scale converts nv12→bgr24 directly.
+    # Inserting format=yuv420p forces a clean software nv12→yuv420p step first.
+    vf = ("format=yuv420p," if hw_decoder else "") + "scale=trunc(iw/2)*2:trunc(ih/2)*2"
     cmd += [
         "-f", "rawvideo",
         "-pix_fmt", "bgr24",
-        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",  # ensure even dimensions
+        "-vf", vf,
         "pipe:1",
     ]
     return cmd
@@ -399,22 +699,46 @@ def mux_audio(video_only_path, original_path, output_path,
         subprocess.run(audio_cmd, capture_output=True, check=True)
 
         # ── Mux video (FFV1, t=0) + extracted audio (t=0) → final output ─────
+        # Use hevc_nvenc (GPU) if available, fall back to libx265 (CPU)
+        def _nvenc_available():
+            r = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-f", "lavfi", "-i", "nullsrc",
+                 "-t", "0", "-c:v", "hevc_nvenc", "-f", "null", "-"],
+                capture_output=True)
+            return r.returncode == 0
+
+        if _nvenc_available():
+            video_codec_args = [
+                "-c:v", "hevc_nvenc",
+                "-rc", "constqp",   # constant quantiser (closest to lossless)
+                "-qp", "0",         # QP 0 = maximum quality
+                "-preset", "p1",    # p1=fastest … p7=slowest (GPU-side)
+                "-tag:v", "hvc1",   # QuickTime / macOS compatible
+                "-pix_fmt", "yuv420p",
+            ]
+            enc_label = "  Encoding (HEVC NVENC GPU + audio)"
+        else:
+            video_codec_args = [
+                "-c:v", "libx265",
+                "-crf", "0",        # lossless HEVC
+                "-preset", preset,
+                "-tag:v", "hvc1",
+                "-pix_fmt", "yuv420p",
+            ]
+            enc_label = "  Encoding (HEVC CPU + audio)"
+
         mux_cmd = [
             "ffmpeg", "-y",
             "-i", video_only_path,   # processed video, PTS 0..N
             "-i", tmp_audio_path,    # audio, PTS 0..N
             "-map", "0:v:0",
             "-map", "1:a:0",
-            "-c:v", "libx265",
-            "-crf", "0",             # lossless HEVC
-            "-preset", preset,
-            "-tag:v", "hvc1",        # QuickTime / macOS compatible
-            "-pix_fmt", "yuv420p",
+            *video_codec_args,
             "-c:a", "copy",
             "-movflags", "+faststart",
             output_path,
         ]
-        rc, stderr = _ffmpeg_with_progress(mux_cmd, total_frames, "  Encoding (HEVC + audio)")
+        rc, stderr = _ffmpeg_with_progress(mux_cmd, total_frames, enc_label)
         if rc != 0:
             # Retry without audio
             print("  Warning: audio mux failed, retrying video-only...")
@@ -422,8 +746,7 @@ def mux_audio(video_only_path, original_path, output_path,
             mux_cmd_no_audio = [
                 "ffmpeg", "-y",
                 "-i", video_only_path,
-                "-c:v", "libx265", "-crf", "0", "-preset", preset,
-                "-tag:v", "hvc1", "-pix_fmt", "yuv420p",
+                *video_codec_args,
                 "-movflags", "+faststart",
                 output_path,
             ]
@@ -456,6 +779,8 @@ class PlateHistory:
         self._data: list = []          # (frame_idx, cx, cy, w, h, conf)
         self.max_history = max_history
         self.miss_count  = 0           # consecutive frames without a detection
+        self._lk_pts: np.ndarray  = None   # shape (N,1,2) float32, full-frame px
+        self._lk_gray: np.ndarray = None   # grayscale frame where _lk_pts were last set
 
     @property
     def has_history(self) -> bool:
@@ -471,13 +796,15 @@ class PlateHistory:
             self._data.pop(0)
         self.miss_count = 0
 
-    def predict_rect(self, frame_idx: int):
+    def predict_rect(self, frame_idx: int, max_expand: int = 20):
         """
         Return (x1, y1, x2, y2) predicted at frame_idx.
 
         Velocity is computed as an exponentially-weighted average of
-        per-frame deltas so recent movement dominates.  The box expands
-        by 2 px per missed frame to account for growing uncertainty.
+        per-frame deltas so recent movement dominates.  The box grows by
+        2 px per missed frame to account for growing positional uncertainty,
+        capped at max_expand pixels per side so a large gap_frames setting
+        doesn't balloon the blur region across the frame.
         Returns None if no history exists.
         """
         if not self._data:
@@ -504,11 +831,74 @@ class PlateHistory:
                 cx_last = cx_last + vx * dt
                 cy_last = cy_last + vy * dt
 
-        expand = self.miss_count * 2          # grow box 2 px per missed frame
+        # Grow 2 px per missed frame, but never more than max_expand px per side
+        expand = min(self.miss_count * 2, max_expand)
         x1 = int(cx_last - w_last * 0.5 - expand)
         y1 = int(cy_last - h_last * 0.5 - expand)
         x2 = int(cx_last + w_last * 0.5 + expand)
         y2 = int(cy_last + h_last * 0.5 + expand)
+        return (x1, y1, x2, y2)
+
+    def refresh_lk(self, gray: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> None:
+        """
+        (Re-)initialise Lucas-Kanade tracking from a freshly-confirmed plate bbox.
+
+        Extracts corner features from the plate crop and stores them alongside
+        the grayscale frame so predict_rect_lk() can propagate them forward.
+        Falls back silently when the crop has too few trackable corners.
+        """
+        crop = gray[y1:y2, x1:x2]
+        if crop.size == 0:
+            return
+        pts = cv2.goodFeaturesToTrack(
+            crop, maxCorners=16, qualityLevel=0.1, minDistance=3, blockSize=5,
+        )
+        if pts is None or len(pts) < 3:
+            return
+        pts[:, 0, 0] += x1   # offset crop-space → full-frame space
+        pts[:, 0, 1] += y1
+        self._lk_pts  = pts
+        self._lk_gray = gray.copy()
+
+    def predict_rect_lk(
+        self, gray: np.ndarray, max_expand: int = 20
+    ) -> "tuple[int,int,int,int] | None":
+        """
+        Propagate stored corner points to *gray* via Lucas-Kanade sparse optical
+        flow, then derive a bounding box from where they landed.
+
+        Updates the stored points and frame so chained gap-fill calls each build
+        on the latest tracked position.  Returns None when too few points survive
+        (caller should fall back to velocity prediction).
+        """
+        if self._lk_pts is None or self._lk_gray is None or not self._data:
+            return None
+
+        new_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+            self._lk_gray, gray, self._lk_pts, None,
+            winSize=(21, 21), maxLevel=3,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03),
+        )
+        if new_pts is None or status is None:
+            return None
+
+        good = new_pts[status.ravel() == 1].reshape(-1, 2)   # (M, 2)
+        if len(good) < 3:
+            return None
+
+        _, _, _, w_last, h_last, _ = self._data[-1]
+        cx = float(np.mean(good[:, 0]))
+        cy = float(np.mean(good[:, 1]))
+
+        expand = min(self.miss_count * 2, max_expand)
+        x1 = int(cx - w_last * 0.5 - expand)
+        y1 = int(cy - h_last * 0.5 - expand)
+        x2 = int(cx + w_last * 0.5 + expand)
+        y2 = int(cy + h_last * 0.5 + expand)
+
+        # Update for the next gap frame — LK expects (N,1,2)
+        self._lk_pts  = good.reshape(-1, 1, 2).astype(np.float32)
+        self._lk_gray = gray.copy()
         return (x1, y1, x2, y2)
 
 
@@ -535,76 +925,131 @@ class VehicleTrack:
         self.miss_count += 1
 
 
+class _VehicleDetections:
+    """
+    Minimal wrapper that presents vehicle bounding boxes in the format
+    BYTETracker.update() expects (supports boolean-mask and integer indexing).
+    """
+    def __init__(self, xyxy, confs, clss):
+        self.xyxy = np.asarray(xyxy, dtype=np.float32).reshape(-1, 4)
+        self.conf = np.asarray(confs, dtype=np.float32).reshape(-1)
+        self.cls  = np.asarray(clss,  dtype=np.float32).reshape(-1)
+        if len(self.xyxy):
+            x1, y1, x2, y2 = self.xyxy[:,0], self.xyxy[:,1], self.xyxy[:,2], self.xyxy[:,3]
+            self.xywh = np.stack([(x1+x2)/2, (y1+y2)/2, x2-x1, y2-y1], axis=1)
+        else:
+            self.xywh = np.zeros((0, 4), dtype=np.float32)
+
+    def __len__(self):
+        return len(self.conf)
+
+    def __getitem__(self, idx):
+        return _VehicleDetections(self.xyxy[idx], self.conf[idx], self.cls[idx])
+
+
 class SceneTracker:
     """
-    Frame-level coordinator for all vehicle tracks.
+    Frame-level coordinator using BYTETracker for vehicle association.
 
-    Each call to update() performs:
-      1. IoU-based greedy matching of incoming vehicle detections to existing tracks.
-      2. Plate history update for matched tracks that have a plate inside them.
-      3. Gap-filling: for tracks where no plate was detected but recent history
-         exists, a predicted position is injected with conf=-1 so downstream
-         code can distinguish predicted from detected regions.
+    Replaces the original greedy-IoU matcher with ByteTrack, which provides:
+      - Kalman-filter position prediction  → survives fast camera / subject motion
+      - Two-stage matching                 → recovers vehicles that briefly disappear
+      - Stable track IDs across gaps       → plate history survives detection drops
+
+    PlateHistory velocity-based gap-fill works on top: when the vehicle detector
+    drops a track temporarily, the plate's last known position + velocity is
+    extrapolated for up to max_gap_frames frames.
     """
 
     def __init__(self, max_gap_frames: int = 8, history_frames: int = 15,
                  min_vehicle_conf: float = 0.60, vehicle_iou_thresh: float = 0.30,
-                 standalone_min_ar: float = 1.2, standalone_max_ar: float = 6.0):
-        self.tracks:            list[VehicleTrack] = []
-        self.max_gap_frames     = max_gap_frames
-        self.history_frames     = history_frames
-        self.min_vehicle_conf   = min_vehicle_conf
-        self.vehicle_iou_thresh = vehicle_iou_thresh
-        self.standalone_min_ar  = standalone_min_ar
-        self.standalone_max_ar  = standalone_max_ar
-        self.frame_idx          = 0
+                 standalone_min_ar: float = 1.2, standalone_max_ar: float = 6.0,
+                 predict_expand_max: int = 20):
+        from types import SimpleNamespace
+        from ultralytics.trackers import BYTETracker
 
-    # ── internal matching ─────────────────────────────────────────────────────
+        self.max_gap_frames      = max_gap_frames
+        self.history_frames      = history_frames
+        self.standalone_min_ar   = standalone_min_ar
+        self.standalone_max_ar   = standalone_max_ar
+        self.predict_expand_max  = predict_expand_max
+        self.frame_idx           = 0
 
-    def _match(self, boxes: list):
-        """
-        Greedy IoU matching between current detections and live tracks.
-        Returns (matched_pairs, new_box_indices, lost_track_indices).
-        """
-        if not self.tracks or not boxes:
-            return [], list(range(len(boxes))), list(range(len(self.tracks)))
-
-        pairs = []
-        for ti, track in enumerate(self.tracks):
-            for bi, box in enumerate(boxes):
-                score = iou(track.box, box)
-                if score >= self.vehicle_iou_thresh:
-                    pairs.append((score, ti, bi))
-        pairs.sort(reverse=True)
-
-        matched_t, matched_b, matched = set(), set(), []
-        for score, ti, bi in pairs:
-            if ti not in matched_t and bi not in matched_b:
-                matched.append((ti, bi))
-                matched_t.add(ti)
-                matched_b.add(bi)
-
-        new_boxes   = [i for i in range(len(boxes))       if i not in matched_b]
-        lost_tracks = [i for i in range(len(self.tracks)) if i not in matched_t]
-        return matched, new_boxes, lost_tracks
+        # BYTETracker hyperparameters tuned for dashcam / action-cam footage:
+        #   track_high_thresh — stage-1: detections above this are matched first
+        #   track_low_thresh  — stage-2: weaker detections used to recover lost tracks
+        #   new_track_thresh  — minimum conf to start a brand-new track
+        #   match_thresh      — max IoU *distance* (= 1 − IoU) for a valid match
+        #   track_buffer      — frames BYTETracker holds a lost track before discarding
+        bt_args = SimpleNamespace(
+            track_high_thresh = min_vehicle_conf,
+            track_low_thresh  = max(0.05, min_vehicle_conf * 0.25),
+            new_track_thresh  = min_vehicle_conf,
+            match_thresh      = 1.0 - vehicle_iou_thresh,    # IoU 0.3 → distance 0.7
+            track_buffer      = max(max_gap_frames * 2, 30), # keep lost tracks long enough
+            fuse_score        = True,
+        )
+        self._byte       = BYTETracker(bt_args)
+        self._track_dict: dict = {}   # track_id (int) → VehicleTrack
 
     # ── public API ────────────────────────────────────────────────────────────
 
-    def update(self, all_vehicles: list, plate_rects: list) -> list:
+    @property
+    def tracks(self) -> list:
+        """List of currently active VehicleTrack objects (for debug overlay)."""
+        return list(self._track_dict.values())
+
+    def update(self, all_vehicles: list, plate_rects: list,
+               frame: np.ndarray = None) -> list:
         """
         all_vehicles : [(cls, x1, y1, x2, y2, conf), ...]
         plate_rects  : [(x1, y1, x2, y2, conf), ...]  — current frame detections
+        frame        : optional BGR frame; enables LK optical-flow gap-fill when given
 
-        Returns effective plate list: detected plates + predicted plates.
-        Predicted entries carry conf = -1.0 so debug overlay can label them.
+        Returns effective plate list: detected plates + gap-filled predicted plates.
+        Predicted entries carry conf = -1.0 so the debug overlay can label them.
         """
-        high_conf = [(v[1], v[2], v[3], v[4])
-                     for v in all_vehicles if v[5] >= self.min_vehicle_conf]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame is not None else None
 
-        # Vehicle zones = current frame detections + last-known positions of live tracks.
-        # A plate overlapping either zone is never considered standalone for AR purposes.
+        # ── 1. Feed vehicle detections to BYTETracker ─────────────────────────
+        if all_vehicles:
+            xyxy  = np.array([[x1, y1, x2, y2] for (_, x1, y1, x2, y2, _) in all_vehicles],
+                             dtype=np.float32)
+            confs = np.array([c   for (*_, c)          in all_vehicles], dtype=np.float32)
+            clss  = np.array([cls for (cls, *_)         in all_vehicles], dtype=np.float32)
+            det   = _VehicleDetections(xyxy, confs, clss)
+        else:
+            det   = _VehicleDetections(np.zeros((0, 4)), [], [])
+
+        # BYTETracker returns active tracks: rows of [x1,y1,x2,y2, id,conf,cls,idx]
+        active = self._byte.update(det)
+
+        # ── 2. Sync our VehicleTrack dict with BYTETracker's output ───────────
+        active_ids = set()
+        for row in active:
+            x1, y1, x2, y2 = int(row[0]), int(row[1]), int(row[2]), int(row[3])
+            tid = int(row[4])
+            active_ids.add(tid)
+
+            if tid not in self._track_dict:
+                vt    = VehicleTrack((x1, y1, x2, y2), self.frame_idx, self.history_frames)
+                vt.id = tid   # use BYTETracker's stable ID instead of the counter
+                self._track_dict[tid] = vt
+            else:
+                self._track_dict[tid].update_box((x1, y1, x2, y2), self.frame_idx)
+
+        # Tracks not returned this frame are missed; drop after gap-fill window
+        for tid in list(self._track_dict):
+            if tid not in active_ids:
+                self._track_dict[tid].mark_missed()
+                if self._track_dict[tid].miss_count > self.max_gap_frames:
+                    del self._track_dict[tid]
+
+        # ── 3. AR-filter standalone plates ────────────────────────────────────
+        # Plates overlapping any current or last-known vehicle zone pass through.
+        # Standalone plates (outside all vehicle boxes) must have a realistic AR.
         vehicle_zones = [(v[1], v[2], v[3], v[4]) for v in all_vehicles] + \
-                        [t.box for t in self.tracks]
+                        [t.box for t in self._track_dict.values()]
         filtered = []
         for p in plate_rects:
             if any(_overlaps(p[:4], z) for z in vehicle_zones):
@@ -616,38 +1061,85 @@ class SceneTracker:
                     filtered.append(p)
         plate_rects = filtered
 
-        matched, new_boxes, lost_tracks = self._match(high_conf)
+        # ── 4. Plate recording + gap-fill (no suppression) ───────────────────────
+        #
+        # We blur EVERY distinct candidate that survives the confidence and AR
+        # filters.  "One plate per vehicle" suppression has been removed because:
+        #
+        #   • Missing a real plate (privacy failure) is always worse than blurring
+        #     an extra region (cosmetic issue).
+        #   • A persistent false positive that keeps winning by raw confidence
+        #     would otherwise permanently shadow the real plate.
+        #
+        # merge_overlapping() in detect_plates() still collapses near-identical
+        # detections of the *same* plate produced by overlapping SAHI tiles, so
+        # we don't blur the same region multiple times.
+        #
+        # History-aware trajectory recording (for gap-fill only):
+        #   Even though we blur all candidates, the PlateHistory still needs a
+        #   single position to track for velocity-based gap-fill prediction.
+        #   We pick the candidate most consistent with the established trajectory:
+        #   - No history yet            → highest confidence
+        #   - ≥ GATE_HISTORY confirmed  → prefer overlap with predicted zone;
+        #                                 fall back to highest confidence if none
+        #                                 overlap (fast vehicle, bad prediction)
+        _GATE_HISTORY = 3
 
-        for ti, bi in matched:
-            self.tracks[ti].update_box(high_conf[bi], self.frame_idx)
-        for bi in new_boxes:
-            self.tracks.append(VehicleTrack(high_conf[bi], self.frame_idx,
-                                            self.history_frames))
-        for ti in lost_tracks:
-            self.tracks[ti].mark_missed()
+        effective = []
+        claimed   = set()   # indices of plate_rects already added to effective
 
-        # Drop tracks that have lost the vehicle for >5 frames
-        self.tracks = [t for t in self.tracks if t.miss_count <= 5]
+        for track in self._track_dict.values():
+            indexed = [(i, p) for i, p in enumerate(plate_rects)
+                       if i not in claimed and _overlaps(p[:4], track.box)]
 
-        effective = list(plate_rects)
+            if indexed:
+                # Add ALL candidates — blur every distinct detection in this box
+                for i, p in indexed:
+                    effective.append(p)
+                    claimed.add(i)
 
-        for track in self.tracks:
-            plates_in = [p for p in plate_rects if _overlaps(p[:4], track.box)]
+                # Pick history-consistent winner for trajectory recording only
+                if track.plate.has_history and len(track.plate._data) >= _GATE_HISTORY:
+                    predicted = track.plate.predict_rect(self.frame_idx,
+                                                         self.predict_expand_max)
+                    if predicted is not None:
+                        gated = [(i, p) for i, p in indexed if _overlaps(p[:4], predicted)]
+                        candidates = gated if gated else indexed
+                    else:
+                        candidates = indexed
+                else:
+                    candidates = indexed
 
-            if plates_in:
-                best = max(plates_in, key=lambda p: p[4] if len(p) > 4 else 1.0)
+                _, best = max(candidates, key=lambda ip: ip[1][4] if len(ip[1]) > 4 else 1.0)
                 track.plate.record(self.frame_idx, *best[:4],
                                    best[4] if len(best) > 4 else 1.0)
+                if gray is not None:
+                    track.plate.refresh_lk(gray, *best[:4])
             else:
+                # No detection overlaps this vehicle — advance the miss counter
                 track.plate.miss_count += 1
                 if 1 <= track.plate.miss_count <= self.max_gap_frames \
                         and track.plate.has_history:
-                    predicted = track.plate.predict_rect(self.frame_idx)
+                    # LK optical flow first (pixel-level); velocity prediction as fallback
+                    predicted = None
+                    if gray is not None:
+                        predicted = track.plate.predict_rect_lk(
+                            gray, self.predict_expand_max
+                        )
+                    if predicted is None:
+                        predicted = track.plate.predict_rect(
+                            self.frame_idx, self.predict_expand_max
+                        )
                     if predicted is not None:
-                        effective.append((*predicted, -1.0))  # conf=-1 = predicted
+                        effective.append((*predicted, -1.0))   # conf=-1 = gap-fill
+
+        # Standalone plates not claimed by any vehicle track pass through as-is
+        for i, p in enumerate(plate_rects):
+            if i not in claimed:
+                effective.append(p)
 
         self.frame_idx += 1
-        return effective
+        return effective, []   # suppressed is always empty — nothing is discarded
 
 
 # ─── Debug overlay colours ───────────────────────────────────────────────────
@@ -787,7 +1279,7 @@ def blur_license_plates(
     own_plate_region: tuple = None,
     vehicle_filter: str = "all",
     preset: str = "medium",
-    tmp_dir: str = "D:/pip-tmp",
+    tmp_dir: str = "/tmp/plate-blur-tmp",
     debug: bool = False,
     tracking_enabled: bool = True,
     max_gap_frames: int = 8,
@@ -795,6 +1287,12 @@ def blur_license_plates(
     min_vehicle_conf: float = 0.60,
     standalone_min_ar: float = 1.2,
     standalone_max_ar: float = 6.0,
+    predict_expand_max: int = 20,
+    detect_scale: float = 1.0,
+    sharpen: bool = False,
+    sharpen_amount: float = 1.5,
+    sharpen_sigma: float = 1.0,
+    vehicle_crop_scale: float = 1.0,
 ):
     print(f"\n{'='*60}")
     print(f"  License Plate Blurring Tool")
@@ -808,10 +1306,17 @@ def blur_license_plates(
     print(f"  Plate conf : {plate_conf} (global)  |  {plate_conf_in_vehicle} (inside vehicle boxes)")
     if own_plate_region:
         print(f"  Own plate region (always blurred): {own_plate_region}")
+    if detect_scale < 1.0:
+        print(f"  Detect : {detect_scale:.2f}× scale  (detection at {detect_scale*100:.0f}% res, blur at full res)")
+    if sharpen:
+        print(f"  Sharpen: enabled  (amount={sharpen_amount}, sigma={sharpen_sigma})")
+    if vehicle_crop_scale > 1.0:
+        print(f"  Crop upscale: {vehicle_crop_scale:.1f}×  (per-vehicle plate pass on full-res crops)")
     if debug:
         print(f"  Mode  : DEBUG (blur applied + detection overlay)")
     if tracking_enabled:
-        print(f"  Track : enabled  (gap={max_gap_frames} frames, history={history_frames})")
+        print(f"  Track : enabled  (gap={max_gap_frames} frames, history={history_frames}, "
+              f"expand_max={predict_expand_max}px)")
     print(f"{'='*60}\n")
 
     info = get_video_info(input_path)
@@ -830,6 +1335,7 @@ def blur_license_plates(
         min_vehicle_conf=min_vehicle_conf,
         standalone_min_ar=standalone_min_ar,
         standalone_max_ar=standalone_max_ar,
+        predict_expand_max=predict_expand_max,
     ) if tracking_enabled else None
 
     frame_size     = width * height * 3
@@ -840,7 +1346,26 @@ def blur_license_plates(
         tmp_path = tmp.name
 
     try:
-        extract_cmd = build_ffmpeg_extract(input_path, start_time, end_time)
+        # CUVID pre-check: probe one decoded frame to detect unsupported codec
+        # profiles (e.g. iPhone 10-bit HEVC, some MOV variants).  CUVID failure
+        # is silent — it produces 0 bytes — which would otherwise create an
+        # empty intermediate and an unplayable output file.
+        video_codec = info.get("codec")
+        if video_codec in _CUVID_DECODERS:
+            _probe_end = (start_time or 0.0) + 1.0 / fps
+            _probe = subprocess.Popen(
+                build_ffmpeg_extract(input_path, start_time, _probe_end, codec=video_codec),
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            )
+            _probe_ok = len(_probe.stdout.read(frame_size)) >= frame_size
+            _probe.stdout.close()
+            _probe.wait()
+            if not _probe_ok:
+                print(f"  Warning: {_CUVID_DECODERS[video_codec]} decode failed for this file "
+                      f"— falling back to software decode")
+                video_codec = None   # None → build_ffmpeg_extract uses software path
+
+        extract_cmd = build_ffmpeg_extract(input_path, start_time, end_time, codec=video_codec)
         encode_cmd  = build_ffmpeg_encode_lossless(width, height, fps, tmp_path)
 
         extract_proc = subprocess.Popen(extract_cmd, stdout=subprocess.PIPE,
@@ -863,6 +1388,7 @@ def blur_license_plates(
                     frame = np.frombuffer(raw, dtype=np.uint8).reshape(
                         (height, width, 3)).copy()
 
+                    suppressed_plates = []   # reset each frame; populated by tracker or dedup
                     plates, vehicles = detect_plates(
                         frame, vehicle_model, plate_model,
                         vehicle_conf=vehicle_conf,
@@ -871,18 +1397,27 @@ def blur_license_plates(
                         plate_conf_in_vehicle=plate_conf_in_vehicle,
                         sahi_slice_size=sahi_slice_size,
                         sahi_overlap=sahi_overlap,
+                        detect_scale=detect_scale,
+                        sharpen=sharpen,
+                        sharpen_amount=sharpen_amount,
+                        sharpen_sigma=sharpen_sigma,
+                        vehicle_crop_scale=vehicle_crop_scale,
                     )
 
-                    # One plate per vehicle — done here so debug can show suppressed ones
                     filter_classes  = VEHICLE_FILTER_MAP.get(vehicle_filter, set(VEHICLE_CLASSES))
                     vehicle_boxes   = [(v[1], v[2], v[3], v[4]) for v in vehicles
                                        if v[0] in filter_classes]
-                    plates, suppressed_plates = suppress_duplicate_plates(plates, vehicle_boxes)
 
                     if tracker is not None:
-                        plates = tracker.update(vehicles, plates)
+                        # Tracker owns dedup: it uses plate history to gate out
+                        # spatially inconsistent false positives before recording.
+                        # suppress_duplicate_plates is intentionally skipped here
+                        # so the tracker sees all candidates, not just the
+                        # highest-confidence one chosen without temporal context.
+                        plates, suppressed_plates = tracker.update(vehicles, plates, frame)
                     else:
-                        vehicle_zones = [(v[1], v[2], v[3], v[4]) for v in vehicles]
+                        # Tracking disabled: AR filter only — no suppression
+                        vehicle_zones = vehicle_boxes
                         ar_filtered = []
                         for p in plates:
                             if any(_overlaps(p[:4], z) for z in vehicle_zones):
@@ -944,11 +1479,12 @@ def blur_license_plates(
 
 def main():
     cfg = load_config()
-    det = cfg["detection"]
+    det  = cfg["detection"]
     sahi = cfg["sahi"]
-    blr = cfg["blur"]
-    out = cfg["output"]
-    trk = cfg.get("tracking", {})
+    blr  = cfg["blur"]
+    out  = cfg["output"]
+    trk  = cfg.get("tracking", {})
+    pre  = cfg.get("preprocessing", {})
 
     parser = argparse.ArgumentParser(
         description="Blur license plates in video with zero quality loss.",
@@ -994,6 +1530,12 @@ Examples:
     parser.add_argument("--debug", action="store_true",
                         help="Write detection overlay video instead of blurring "
                              "(blue=vehicles, green=plate regions, orange=own plate)")
+    parser.add_argument("--detect-scale", dest="detect_scale", type=float,
+                        default=float(det.get("detect_scale", 1.0)),
+                        help="Fraction of resolution used for detection (default: "
+                             f"{det.get('detect_scale', 1.0)}).  "
+                             "0.5 = ~5× faster on 4K, minimal accuracy loss at "
+                             "typical dashcam distances. Blur always at full res.")
 
     args = parser.parse_args()
 
@@ -1027,8 +1569,14 @@ Examples:
         max_gap_frames=int(trk.get("max_gap_frames", 8)),
         history_frames=int(trk.get("history_frames", 15)),
         min_vehicle_conf=float(trk.get("min_vehicle_conf", 0.60)),
+        predict_expand_max=int(trk.get("predict_expand_max", 20)),
         standalone_min_ar=float(det.get("standalone_min_ar", 1.2)),
         standalone_max_ar=float(det.get("standalone_max_ar", 6.0)),
+        detect_scale=args.detect_scale,
+        sharpen=bool(pre.get("sharpen", False)),
+        sharpen_amount=float(pre.get("sharpen_amount", 1.5)),
+        sharpen_sigma=float(pre.get("sharpen_sigma", 1.0)),
+        vehicle_crop_scale=float(pre.get("vehicle_crop_scale", 1.0)),
     )
 
 

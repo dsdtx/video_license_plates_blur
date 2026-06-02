@@ -10,7 +10,7 @@ plate_conf = 0.45
 # Plate model — lower threshold applied only when a plate overlaps a detected
 # vehicle bounding box. Set lower than plate_conf to catch blurry / angled
 # plates on fast-moving vehicles (e.g. motorbikes on the Autobahn).
-plate_conf_in_vehicle = 0.10
+plate_conf_in_vehicle = 0.4
 
 # Aspect-ratio (width / height) limits for plates detected outside any vehicle
 # bounding box. Real plates are always wider than tall; anything outside this
@@ -18,6 +18,14 @@ plate_conf_in_vehicle = 0.10
 # Plates inside vehicle boxes are never filtered by this rule.
 standalone_min_ar = 1.2
 standalone_max_ar = 6.0
+
+# Detection scale — fraction of the original resolution fed to the plate model.
+# 1.0 = full resolution (default, best accuracy, slowest).
+# 0.5 = half resolution (e.g. 4K → 2K). ~5× faster on 4K footage with minimal
+#       accuracy loss at typical dashcam distances (plates ≥ ~5 m are fine).
+#       Blur is always applied at full resolution regardless of this setting.
+# 0.75 = a balanced middle ground.
+detect_scale = 1.0
 
 
 # ── SAHI sliced inference ──────────────────────────────────────────────────────
@@ -27,7 +35,7 @@ standalone_max_ar = 6.0
 slice_size = 640
 
 # Fractional overlap between adjacent tiles (0.0 – 0.5)
-overlap = 0.20
+overlap = 0.5
 
 
 # ── Blur ───────────────────────────────────────────────────────────────────────
@@ -48,15 +56,49 @@ enabled = true
 
 # How many consecutive frames without a plate detection to fill using prediction.
 # At 30 fps, 8 frames = ~0.27 s. Increase for faster-moving vehicles.
-max_gap_frames = 8
+max_gap_frames = 30
 
 # How many past detections to use when estimating plate velocity.
 # More = smoother prediction but slower to adapt to direction changes.
 history_frames = 15
 
+# Maximum pixels added to each side of a predicted (gap-fill) plate box.
+# The box grows 2 px per missed frame to account for positional uncertainty,
+# but is capped here so a large max_gap_frames does not balloon the blur
+# region across the frame. 20 px = 10 missed frames worth of growth.
+predict_expand_max = 20
+
 # Minimum vehicle detection confidence to start/maintain a track.
 # Lower = track more vehicles but risk false tracks.
-min_vehicle_conf = 0.60
+min_vehicle_conf = 0.50
+
+
+# ── Frame preprocessing ───────────────────────────────────────────────────────
+[preprocessing]
+
+# Unsharp masking — sharpens the detection frame before SAHI tiling.
+# Helps recover plates in blurry, soft-focus, or heavily compressed footage
+# by amplifying edge contrast before the plate model sees the image.
+# Has no effect on the output blur; it only affects what the detector sees.
+sharpen        = false
+
+# How strongly to amplify the sharpening:
+#   0.5 = subtle boost    1.5 = strong (recommended starting point)
+#   3.0 = aggressive (may introduce halos on high-contrast edges)
+sharpen_amount = 1.5
+
+# Gaussian radius used to compute the unsharp mask (pixels).
+# 1.0 sharpens fine detail; increase to 2.0 to target coarser blur.
+sharpen_sigma  = 1.0
+
+# Per-vehicle crop upscaling — runs a second plate-detection pass on each
+# detected vehicle's bounding box, extracted from the original full-resolution
+# frame and upscaled by this factor with Lanczos resampling.
+# A plate that is 30 px wide at the original scale becomes 60–90 px wide,
+# dramatically improving confidence on distant or small vehicles that the
+# main SAHI pass misses.
+# 1.0 = disabled  |  2.0 = recommended  |  3.0 = aggressive (slower)
+vehicle_crop_scale = 1.0
 
 
 # ── Output / encoding ─────────────────────────────────────────────────────────
@@ -66,4 +108,4 @@ min_vehicle_conf = 0.60
 preset = "medium"
 
 # Directory for temporary lossless intermediate files (needs ~2x input size free)
-tmp_dir = "D:/pip-tmp"
+tmp_dir = "/tmp/plate-blur-tmp"

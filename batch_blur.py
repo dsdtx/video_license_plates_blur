@@ -9,6 +9,7 @@ Usage:
 Any extra arguments are forwarded directly to blur_plates.py for every video.
 """
 import argparse, os, subprocess, sys
+from datetime import datetime
 from pathlib import Path
 from tqdm import tqdm
 
@@ -47,8 +48,10 @@ def main():
     if not videos:
         sys.exit(f"No video files found in '{folder}'.")
 
-    outdir = Path(args.outdir).resolve() if args.outdir else None
-    if outdir:
+    outdir = None
+    if args.outdir:
+        ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
+        outdir = Path(args.outdir).resolve().parent / (Path(args.outdir).name + "_" + ts)
         outdir.mkdir(parents=True, exist_ok=True)
 
     blur_script = Path(__file__).parent / "blur_plates.py"
@@ -60,11 +63,7 @@ def main():
         print(f"Extra args passed to blur_plates.py: {' '.join(extra)}")
     print()
 
-    # Ensure ffmpeg/ffprobe are findable in child processes
     env = os.environ.copy()
-    ffmpeg_bin = r"C:\ffmpeg\bin"
-    if ffmpeg_bin not in env.get("PATH", ""):
-        env["PATH"] = ffmpeg_bin + os.pathsep + env.get("PATH", "")
 
     failed = []
     bar = tqdm(videos, unit="video", dynamic_ncols=True,
