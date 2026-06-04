@@ -107,5 +107,7 @@ vehicle_crop_scale = 1.0
 # libx265 preset for final HEVC encode (ultrafast / fast / medium / slow)
 preset = "medium"
 
-# Directory for temporary lossless intermediate files (needs ~2x input size free)
-tmp_dir = "/tmp/plate-blur-tmp"
+# Directory for temporary lossless intermediate files (needs ~2x input size free).
+# "auto" picks the OS temp dir at runtime (e.g. /tmp on Linux/macOS,
+# %TEMP% on Windows). Set an explicit path to use a specific drive/location.
+tmp_dir = "auto"

@@ -1279,7 +1279,7 @@ def blur_license_plates(
     own_plate_region: tuple = None,
     vehicle_filter: str = "all",
     preset: str = "medium",
-    tmp_dir: str = "/tmp/plate-blur-tmp",
+    tmp_dir: str = "auto",
     debug: bool = False,
     tracking_enabled: bool = True,
     max_gap_frames: int = 8,
@@ -1294,6 +1294,9 @@ def blur_license_plates(
     sharpen_sigma: float = 1.0,
     vehicle_crop_scale: float = 1.0,
 ):
+    if tmp_dir == "auto":
+        tmp_dir = os.path.join(tempfile.gettempdir(), "plate-blur-tmp")
+
     print(f"\n{'='*60}")
     print(f"  License Plate Blurring Tool")
     print(f"{'='*60}")
