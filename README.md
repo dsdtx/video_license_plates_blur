@@ -139,12 +139,32 @@ python blur_plates.py input.mp4 output.mp4 --start 2:30 --end 3:00
 # Motorbike plates only
 python blur_plates.py input.mp4 output.mp4 --vehicles motorbike
 
-# Camera mounted behind your own plate (always blur a fixed region)
+# Camera mounted behind your own plate (always cover a fixed region)
 python blur_plates.py input.mp4 output.mp4 --own-plate 1700,900,2200,1100
 
 # Debug mode — draws detection boxes instead of blurring (blue=vehicle, green=plate)
 python blur_plates.py input.mp4 debug.mp4 --debug
+
+# Replace plates with a solid colour (R,G,B) instead of blurring
+python blur_plates.py input.mp4 output.mp4 --mode color --color 0,0,0
+
+# Stamp a custom image (logo / sticker / portrait) onto every plate
+python blur_plates.py input.mp4 output.mp4 --mode image --image my_sticker.png
 ```
+
+### Redaction modes
+
+| `--mode` | What gets drawn over each plate | Extra flag |
+|---|---|---|
+| `blur` (default) | Strong Gaussian blur | `--blur N` for kernel size |
+| `color` | Solid colour fill | `--color R,G,B` (0-255 each) |
+| `image` | A PNG/JPG stretched to fill the plate. PNG alpha is honoured. | `--image PATH` |
+
+The selected mode applies to **every plate** in the output, including the
+`--own-plate` fixed region — so the result has a consistent look.
+
+Defaults for these flags can also be set in `config.toml` under the `[redact]`
+section so you don't have to pass them every time.
 
 ### Batch — entire folder
 
@@ -164,6 +184,9 @@ python batch_blur.py /path/to/folder --outdir /path/to/output --vehicles motorbi
 | `--start` / `--end` | — | Process a time range (`MM:SS` or `HH:MM:SS`) |
 | `--own-plate` | — | Fixed region to always blur (`x1,y1,x2,y2`) |
 | `--debug` | off | Overlay detection boxes instead of blurring |
+| `--mode` | `blur` | Redaction style: `blur`, `color`, or `image` |
+| `--color` | `0,0,0` | Solid fill colour for `--mode color` (R,G,B) |
+| `--image` | — | Path to overlay image for `--mode image` (PNG with alpha supported) |
 
 ---
 

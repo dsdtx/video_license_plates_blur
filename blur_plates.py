@@ -24,6 +24,7 @@ import sys
 import argparse
 import tempfile
 import threading
+import time
 import tomllib
 from datetime import datetime
 from tqdm import tqdm
@@ -570,6 +571,167 @@ def apply_blur(frame, rects, blur_strength=61, padding=8):
         blurred = cv2.GaussianBlur(blurred, (k, k), 0)
         frame[y1:y2, x1:x2] = blurred
     return frame
+
+
+def apply_solid_color(frame, rects, color=(0, 0, 0), padding=8):
+    """Fill each rectangle region with a solid BGR colour."""
+    h, w = frame.shape[:2]
+    for rect in rects:
+        x1, y1, x2, y2 = rect[:4]
+        x1 = max(0, x1 - padding)
+        y1 = max(0, y1 - padding)
+        x2 = min(w, x2 + padding)
+        y2 = min(h, y2 + padding)
+        if x2 > x1 and y2 > y1:
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, -1)
+    return frame
+
+
+def apply_image_overlay(frame, rects, overlay_img, padding=8):
+    """
+    Paste *overlay_img* (BGR ndarray, already loaded) onto each rectangle
+    region, stretched to fill the padded rect exactly.
+
+    overlay_img may include an alpha channel (4 channels).  If alpha is
+    present it is used for compositing so the corners of e.g. a circular
+    logo blend with the underlying frame; otherwise the overlay covers
+    the rect opaquely.
+    """
+    h, w = frame.shape[:2]
+    has_alpha = overlay_img.ndim == 3 and overlay_img.shape[2] == 4
+    for rect in rects:
+        x1, y1, x2, y2 = rect[:4]
+        x1 = max(0, x1 - padding)
+        y1 = max(0, y1 - padding)
+        x2 = min(w, x2 + padding)
+        y2 = min(h, y2 + padding)
+        rw, rh = x2 - x1, y2 - y1
+        if rw <= 0 or rh <= 0:
+            continue
+        resized = cv2.resize(overlay_img, (rw, rh), interpolation=cv2.INTER_LINEAR)
+        if has_alpha:
+            bgr = resized[:, :, :3].astype(np.float32)
+            alpha = (resized[:, :, 3:4].astype(np.float32)) / 255.0
+            roi = frame[y1:y2, x1:x2].astype(np.float32)
+            blended = bgr * alpha + roi * (1.0 - alpha)
+            frame[y1:y2, x1:x2] = blended.astype(np.uint8)
+        else:
+            frame[y1:y2, x1:x2] = resized
+    return frame
+
+
+def apply_redaction(frame, rects, mode="blur",
+                    blur_strength=61, color=(0, 0, 0),
+                    overlay_img=None, padding=8):
+    """
+    Dispatcher for the three redaction modes.
+
+    mode = "blur"  → Gaussian blur (apply_blur)
+    mode = "color" → solid colour fill (apply_solid_color)
+    mode = "image" → stretched overlay image (apply_image_overlay)
+
+    Falls back to blur if mode == "image" but no overlay_img is provided.
+    """
+    if mode == "color":
+        return apply_solid_color(frame, rects, color=color, padding=padding)
+    if mode == "image" and overlay_img is not None:
+        return apply_image_overlay(frame, rects, overlay_img, padding=padding)
+    return apply_blur(frame, rects, blur_strength=blur_strength, padding=padding)
+
+
+def load_overlay_image(path: str):
+    """Load an overlay image (PNG/JPG); preserves alpha channel when present."""
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise FileNotFoundError(f"Could not read overlay image: {path}")
+    return img
+
+
+def parse_color(s: str):
+    """Parse 'R,G,B' (0-255) into a BGR tuple for OpenCV."""
+    parts = [int(v.strip()) for v in s.split(",")]
+    if len(parts) != 3:
+        raise ValueError(f"Expected R,G,B but got: {s!r}")
+    if any(p < 0 or p > 255 for p in parts):
+        raise ValueError(f"Color components must be 0-255: {s!r}")
+    r, g, b = parts
+    return (b, g, r)   # OpenCV uses BGR
+
+
+def _format_duration(seconds: float) -> str:
+    """Human-readable duration: '12.3s', '5m23s', or '1h12m05s'."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    if seconds < 3600:
+        m, s = divmod(int(round(seconds)), 60)
+        return f"{m}m{s:02d}s"
+    h, rem = divmod(int(round(seconds)), 3600)
+    m, s   = divmod(rem, 60)
+    return f"{h}h{m:02d}m{s:02d}s"
+
+
+def _hardware_label(device: str) -> str:
+    """Short string describing the compute device used (GPU name + VRAM, or CPU)."""
+    if device == "cuda":
+        try:
+            import torch
+            name = torch.cuda.get_device_name(0)
+            total_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            return f"GPU - {name} ({total_gb:.1f} GB VRAM)"
+        except Exception:
+            return "GPU (CUDA)"
+    # CPU fallback
+    try:
+        import platform
+        cpu = platform.processor() or platform.machine() or "CPU"
+        n   = os.cpu_count() or "?"
+        return f"CPU - {cpu} ({n} threads)"
+    except Exception:
+        return "CPU"
+
+
+def _print_run_summary(*, elapsed_total, elapsed_process, device, info,
+                       input_path, output_path, frame_num, total_plates,
+                       redact_mode, redact_color, redact_image_path,
+                       vehicle_filter):
+    """Print a compact one-page summary at the end of a video run."""
+    bar = "═" * 60
+
+    in_name  = os.path.basename(input_path)
+    out_name = os.path.basename(output_path)
+    res      = f"{info['width']}x{info['height']}"
+    in_fps   = info["fps"]
+    in_codec = info.get("codec", "?")
+    in_dur   = info.get("duration", 0.0)
+    out_size = os.path.getsize(output_path) / 1024 / 1024 if os.path.exists(output_path) else 0.0
+
+    proc_fps   = frame_num / elapsed_process if elapsed_process > 0 else 0.0
+    speed_x    = (frame_num / in_fps) / elapsed_total if in_fps and elapsed_total > 0 else 0.0
+    plates_pf  = total_plates / frame_num if frame_num else 0.0
+
+    mode_desc = redact_mode
+    if redact_mode == "color":
+        b, g, r = redact_color
+        mode_desc = f"color (R={r} G={g} B={b})"
+    elif redact_mode == "image":
+        mode_desc = f"image ({os.path.basename(redact_image_path)})" if redact_image_path else "image"
+
+    print(f"\n{bar}")
+    print(f"  Run summary")
+    print(f"{bar}")
+    print(f"  Hardware       :  {_hardware_label(device)}")
+    print(f"  Input          :  {in_name}")
+    print(f"                    {res} @ {in_fps:.2f} fps  |  {in_codec}  |  {_format_duration(in_dur)}")
+    print(f"  Output         :  {out_name}")
+    print(f"                    {out_size:.1f} MB  |  HEVC (lossless intermediate → CRF 0)")
+    print(f"  Redaction      :  {mode_desc}")
+    if vehicle_filter and vehicle_filter != "all":
+        print(f"  Vehicle filter :  {vehicle_filter} only")
+    print(f"  Frames         :  {frame_num:,} processed")
+    print(f"  Plates         :  {total_plates:,} redacted   ({plates_pf:.2f} per frame)")
+    print(f"  Throughput     :  {proc_fps:.1f} fps processing  |  {speed_x:.2f}x realtime")
+    print(f"  Total time     :  {_format_duration(elapsed_total)}")
+    print(f"{bar}\n")
 
 
 _CUVID_DECODERS = {
@@ -1173,26 +1335,33 @@ def _dbg_box(img, x1, y1, x2, y2, color, label, thickness=3):
 
 def draw_debug_overlay(frame, plate_rects, all_vehicles, own_plate_region=None,
                        blur_padding=8, blur_strength=61, tracker=None,
-                       suppressed_plates=None):
+                       suppressed_plates=None,
+                       redact_mode="blur", redact_color=(0, 0, 0),
+                       overlay_img=None):
     """
     Returns a debug frame that shows exactly what the production output will look like:
-      - Blur is applied to all detected regions (identical to production)
+      - Redaction (blur / solid colour / image overlay) is applied to all detected
+        regions, matching production output exactly
       - Blue box     = vehicle detection  (label: class conf | #id Nf detected)
       - Teal box     = tracked vehicle whose detector dropped this frame (label: gap N/M)
       - Green box    = raw plate detection boundary
       - Yellow box   = tracker-predicted plate (gap fill)
-      - Red box      = padded blur region (what was actually erased)
+      - Red box      = padded redaction region (what was actually erased)
       - Orange box   = own-plate fixed region
     """
     h, w = frame.shape[:2]
     vis = frame.copy()
 
-    # ── Step 1: apply the real blur so the frame looks like production output ──
+    # ── Step 1: apply the real redaction so the frame looks like production ──
     all_rects = list(plate_rects)
     if own_plate_region:
         all_rects.append(own_plate_region)
     if all_rects:
-        vis = apply_blur(vis, all_rects, blur_strength=blur_strength, padding=blur_padding)
+        vis = apply_redaction(vis, all_rects, mode=redact_mode,
+                              blur_strength=blur_strength,
+                              color=redact_color,
+                              overlay_img=overlay_img,
+                              padding=blur_padding)
 
     # ── Step 2: build a lookup of track data keyed by closest vehicle box ─────
     # Maps each track to its detected vehicle (if any) so we can annotate labels.
@@ -1293,12 +1462,24 @@ def blur_license_plates(
     sharpen_amount: float = 1.5,
     sharpen_sigma: float = 1.0,
     vehicle_crop_scale: float = 1.0,
+    redact_mode: str = "blur",
+    redact_color: tuple = (0, 0, 0),
+    redact_image_path: str = None,
 ):
     if tmp_dir == "auto":
         tmp_dir = os.path.join(tempfile.gettempdir(), "plate-blur-tmp")
+    # Capture wall-clock start so we can report total + processing-only time
+    # at the end. Uses a different name from the `start_time` parameter (which
+    # is the video trim start, not a timestamp).
+    _run_start_ts = time.perf_counter()
+
+    # Load the overlay image (if any) once, up front
+    overlay_img = None
+    if redact_mode == "image" and redact_image_path:
+        overlay_img = load_overlay_image(redact_image_path)
 
     print(f"\n{'='*60}")
-    print(f"  License Plate Blurring Tool")
+    print(f"  License Plate Redaction Tool")
     print(f"{'='*60}")
     print(f"  Input : {input_path}")
     print(f"  Output: {output_path}")
@@ -1308,7 +1489,14 @@ def blur_license_plates(
         print(f"  Filter: {vehicle_filter} plates only")
     print(f"  Plate conf : {plate_conf} (global)  |  {plate_conf_in_vehicle} (inside vehicle boxes)")
     if own_plate_region:
-        print(f"  Own plate region (always blurred): {own_plate_region}")
+        print(f"  Own plate region (always redacted): {own_plate_region}")
+    print(f"  Mode  : {redact_mode}", end="")
+    if redact_mode == "color":
+        print(f"  (BGR {redact_color})")
+    elif redact_mode == "image" and overlay_img is not None:
+        print(f"  (overlay {redact_image_path})")
+    else:
+        print()
     if detect_scale < 1.0:
         print(f"  Detect : {detect_scale:.2f}× scale  (detection at {detect_scale*100:.0f}% res, blur at full res)")
     if sharpen:
@@ -1378,6 +1566,7 @@ def blur_license_plates(
 
         frame_num    = 0
         total_plates = 0
+        _process_start_ts = time.perf_counter()
 
         with tqdm(total=total_frames, unit="frame", dynamic_ncols=True,
                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} frames "
@@ -1445,10 +1634,17 @@ def blur_license_plates(
                                                    blur_padding=blur_padding,
                                                    blur_strength=blur_strength,
                                                    tracker=tracker,
-                                                   suppressed_plates=suppressed_plates)
+                                                   suppressed_plates=suppressed_plates,
+                                                   redact_mode=redact_mode,
+                                                   redact_color=redact_color,
+                                                   overlay_img=overlay_img)
                     elif plates:
-                        frame = apply_blur(frame, plates, blur_strength=blur_strength,
-                                           padding=blur_padding)
+                        frame = apply_redaction(frame, plates,
+                                                mode=redact_mode,
+                                                blur_strength=blur_strength,
+                                                color=redact_color,
+                                                overlay_img=overlay_img,
+                                                padding=blur_padding)
 
                     encode_proc.stdin.write(frame.tobytes())
                     frame_num += 1
@@ -1462,7 +1658,10 @@ def blur_license_plates(
                 encode_proc.stdin.close()
                 encode_proc.wait()
 
-        action = "annotated" if debug else "blurred"
+        # Wall-clock processing time = detection + draw loop, before muxing.
+        _elapsed_process = time.perf_counter() - _process_start_ts
+
+        action = "annotated" if debug else "redacted"
         print(f"\n  Processed : {frame_num} frames")
         print(f"  Detections: {total_plates} plate regions {action}")
 
@@ -1471,8 +1670,22 @@ def blur_license_plates(
         mux_audio(tmp_path, input_path, output_path, start_time, end_time, fps,
                   total_frames=frame_num, preset=preset, tmp_dir=tmp_dir)
 
-        size_mb = os.path.getsize(output_path) / 1024 / 1024
-        print(f"\n  Done!  Output: {output_path}  ({size_mb:.1f} MB)\n")
+        # End-of-run summary: hardware, timing, throughput, mode, settings.
+        _elapsed_total = time.perf_counter() - _run_start_ts
+        _print_run_summary(
+            elapsed_total   = _elapsed_total,
+            elapsed_process = _elapsed_process,
+            device          = device,
+            info            = info,
+            input_path      = input_path,
+            output_path     = output_path,
+            frame_num       = frame_num,
+            total_plates    = total_plates,
+            redact_mode     = redact_mode,
+            redact_color    = redact_color,
+            redact_image_path = redact_image_path,
+            vehicle_filter  = vehicle_filter,
+        )
         return frame_num, total_plates
 
     finally:
@@ -1488,6 +1701,7 @@ def main():
     out  = cfg["output"]
     trk  = cfg.get("tracking", {})
     pre  = cfg.get("preprocessing", {})
+    red  = cfg.get("redact", {})
 
     parser = argparse.ArgumentParser(
         description="Blur license plates in video with zero quality loss.",
@@ -1508,6 +1722,12 @@ Examples:
 
   # Debug mode — see what gets detected without blurring
   python blur_plates.py final.mov debug.mov --start 0:10 --end 0:20 --debug
+
+  # Replace plates with a solid colour instead of blurring
+  python blur_plates.py final.mov output.mov --mode color --color 255,0,0
+
+  # Overlay a custom image (logo / sticker / portrait) onto every plate
+  python blur_plates.py final.mov output.mov --mode image --image my_sticker.png
         """,
     )
     parser.add_argument("input",  help="Input video path")
@@ -1539,6 +1759,22 @@ Examples:
                              f"{det.get('detect_scale', 1.0)}).  "
                              "0.5 = ~5× faster on 4K, minimal accuracy loss at "
                              "typical dashcam distances. Blur always at full res.")
+    parser.add_argument("--mode", dest="mode",
+                        default=red.get("mode", "blur"),
+                        choices=["blur", "color", "image"],
+                        help="Redaction style applied to detected plates "
+                             "(default: blur). "
+                             "color = solid fill, image = stretched overlay.")
+    parser.add_argument("--color", dest="color",
+                        default=red.get("color", "0,0,0"),
+                        metavar="R,G,B",
+                        help="Solid fill colour when --mode color (default: 0,0,0 = black). "
+                             "Values 0-255.")
+    parser.add_argument("--image", dest="image",
+                        default=red.get("image", None),
+                        metavar="PATH",
+                        help="Overlay image when --mode image. PNG with alpha is supported. "
+                             "The image is stretched to fill each plate rectangle.")
 
     args = parser.parse_args()
 
@@ -1550,6 +1786,16 @@ Examples:
         sys.exit(1)
 
     own_plate = parse_region(args.own_plate) if args.own_plate else None
+
+    # Validate redaction-mode prerequisites
+    redact_color = parse_color(args.color) if args.mode == "color" else (0, 0, 0)
+    if args.mode == "image":
+        if not args.image:
+            print("Error: --mode image requires --image PATH")
+            sys.exit(1)
+        if not os.path.exists(args.image):
+            print(f"Error: overlay image not found: {args.image}")
+            sys.exit(1)
 
     blur_license_plates(
         input_path=args.input,
@@ -1580,6 +1826,9 @@ Examples:
         sharpen_amount=float(pre.get("sharpen_amount", 1.5)),
         sharpen_sigma=float(pre.get("sharpen_sigma", 1.0)),
         vehicle_crop_scale=float(pre.get("vehicle_crop_scale", 1.0)),
+        redact_mode=args.mode,
+        redact_color=redact_color,
+        redact_image_path=args.image if args.mode == "image" else None,
     )
 
 

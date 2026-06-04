@@ -101,6 +101,26 @@ sharpen_sigma  = 1.0
 vehicle_crop_scale = 1.0
 
 
+# ── Redaction style ───────────────────────────────────────────────────────────
+# What gets drawn over each detected plate region (and the --own-plate region).
+# Can be overridden on the CLI with --mode / --color / --image.
+[redact]
+
+# "blur"  → Gaussian blur (default, original behaviour)
+# "color" → solid colour fill
+# "image" → custom image stretched onto every plate
+mode = "blur"
+
+# Default fill colour for mode = "color"  (R,G,B, 0-255)
+# CLI: --color 255,0,0
+color = "0,0,0"
+
+# Default overlay image path for mode = "image".  Leave blank to require --image.
+# CLI: --image /path/to/sticker.png
+# Supports PNG with alpha channel (the alpha is honoured during compositing).
+image = ""
+
+
 # ── Output / encoding ─────────────────────────────────────────────────────────
 [output]
 
