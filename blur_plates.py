@@ -274,11 +274,14 @@ def detect_plates(frame, vehicle_model, plate_model, device="cpu", vehicle_conf=
         if conf < required:
             continue
 
-        # Scale coords back to full-resolution space
+        # Scale coords back to full-resolution space.
+        # Tuple format: (x1, y1, x2, y2, conf, source) where source is one of
+        # 'sahi' | 'crop' | 'pred' | 'own'.  Older code reading rect[:5] is
+        # unaffected by the extra trailing field.
         plate_rects.append((
             int(x1 * coord_scale), int(y1 * coord_scale),
             int(x2 * coord_scale), int(y2 * coord_scale),
-            conf,
+            conf, "sahi",
         ))
 
     # ── Step 3b: per-vehicle crop upscale pass ────────────────────────────────
@@ -333,7 +336,7 @@ def detect_plates(frame, vehicle_model, plate_model, device="cpu", vehicle_conf=
                     ox2 = cx1 + int(px2 * inv_crop)
                     oy2 = cy1 + int(py2 * inv_crop)
                     if ox2 > ox1 and oy2 > oy1:
-                        plate_rects.append((ox1, oy1, ox2, oy2, c))
+                        plate_rects.append((ox1, oy1, ox2, oy2, c, "crop"))
 
     # ── Step 4: dedup ─────────────────────────────────────────────────────────
     return merge_overlapping(plate_rects), all_vehicles
@@ -489,7 +492,7 @@ def detect_plates_batched(frames, vehicle_model, plate_model, device,
             required = plate_conf_in_vehicle if in_vehicle else plate_conf
             if conf_val < required:
                 continue
-            plate_rects.append((x1, y1, x2, y2, conf_val))
+            plate_rects.append((x1, y1, x2, y2, conf_val, "sahi"))
         results.append((merge_overlapping(plate_rects), all_vehicles))
 
     return results
@@ -1293,7 +1296,9 @@ class SceneTracker:
                             self.frame_idx, self.predict_expand_max
                         )
                     if predicted is not None:
-                        effective.append((*predicted, -1.0))   # conf=-1 = gap-fill
+                        # conf=-1 marks gap-fill; source 'pred' lets the overlay
+                        # render these as dashed yellow boxes instead of solid green
+                        effective.append((*predicted, -1.0, "pred"))
 
         # Standalone plates not claimed by any vehicle track pass through as-is
         for i, p in enumerate(plate_rects):
@@ -1433,6 +1438,365 @@ def draw_debug_overlay(frame, plate_rects, all_vehicles, own_plate_region=None,
     return vis
 
 
+# ─── DEBUG DATA mode (A: extended overlay, B: side HUD panel) ────────────────
+
+# Brand palette (BGR for OpenCV).  Kept in sync with the dsdt.x assets.
+_DD_VOID_BG   = (15,  15,  18)
+_DD_HUD_BG    = (18,  18,  24)
+_DD_HUD_LINE  = (40,  40,  50)
+_DD_WHITE     = (240, 240, 240)
+_DD_DIM       = (140, 140, 150)
+_DD_RED       = (26,  0,   226)    # Signal Red
+_DD_BLUE      = (255, 102, 0)      # Data Blue
+_DD_GREEN     = (0,   230, 0)      # detection box
+_DD_YELLOW    = (0,   220, 220)    # predicted (gap-fill)
+_DD_ORANGE    = (0,   140, 255)    # own-plate
+_DD_TRAIL     = (255, 200, 80)     # cyan trajectory tail
+_DD_GHOST     = (90,  90,  100)    # rejected / dropped
+
+# Source-to-colour map for plate boxes
+_DD_SOURCE_COLOR = {
+    "sahi": _DD_GREEN,
+    "crop": _DD_GREEN,
+    "pred": _DD_YELLOW,
+    "own":  _DD_ORANGE,
+}
+
+_DD_FONT_DIR = os.path.join(os.path.expanduser("~"),
+                             ".local/share/fonts/dsdtx")
+_DD_F_DISP  = os.path.join(_DD_FONT_DIR, "OrbitronVar.ttf")
+_DD_F_BODY  = os.path.join(_DD_FONT_DIR, "Rajdhani-SemiBold.ttf")
+_DD_F_MONO  = os.path.join(_DD_FONT_DIR, "JetBrainsMono-Regular.ttf")
+_DD_F_MONOB = os.path.join(_DD_FONT_DIR, "JetBrainsMono-Bold.ttf")
+_DD_HUD_W   = 320
+
+
+def _dd_have_pil_fonts() -> bool:
+    """All brand fonts present? Falls back to OpenCV Hershey if missing."""
+    return all(os.path.exists(p) for p in
+               (_DD_F_DISP, _DD_F_BODY, _DD_F_MONO, _DD_F_MONOB))
+
+
+def _dd_tag(img, x, y, text, bg_bgr, fg_bgr=_DD_WHITE, fs=0.5, pad=4):
+    """Solid pill-style tag for plate / vehicle labels."""
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_DUPLEX, fs, 1)
+    h_img, w_img = img.shape[:2]
+    # Draw above the box if there's room, otherwise below
+    if y - th - pad * 2 >= 0:
+        bg_y1, bg_y2, ty = y - th - pad * 2, y, y - pad
+    else:
+        bg_y1, bg_y2, ty = y, y + th + pad * 2, y + th + pad
+    lx = min(x, w_img - tw - pad * 2)
+    cv2.rectangle(img, (lx, bg_y1), (lx + tw + pad * 2, bg_y2), bg_bgr, -1)
+    cv2.putText(img, text, (lx + pad, ty), cv2.FONT_HERSHEY_DUPLEX, fs,
+                fg_bgr, 1, cv2.LINE_AA)
+
+
+def _dd_dashed_rect(img, x1, y1, x2, y2, color, thickness=2, dash=8, gap=4):
+    """Dashed rectangle for predicted (gap-fill) plates."""
+    step = dash + gap
+    for ix in range(x1, x2, step):
+        cv2.line(img, (ix, y1), (min(ix+dash, x2), y1), color, thickness)
+        cv2.line(img, (ix, y2), (min(ix+dash, x2), y2), color, thickness)
+    for iy in range(y1, y2, step):
+        cv2.line(img, (x1, iy), (x1, min(iy+dash, y2)), color, thickness)
+        cv2.line(img, (x2, iy), (x2, min(iy+dash, y2)), color, thickness)
+
+
+def draw_extended_overlay(frame, plate_rects, all_vehicles, tracker=None,
+                          blur_padding=8, blur_strength=61,
+                          redact_mode="blur", redact_color=(0, 0, 0),
+                          overlay_img=None):
+    """
+    DEBUG DATA - mode A.  Returns a frame with the actual redaction applied
+    plus rich annotations: source-tagged plate boxes, vehicle boxes with
+    track IDs, ghost tracks, plate trajectory trails, and a top HUD strip
+    summarising what's in this frame.
+    """
+    h, w = frame.shape[:2]
+    vis = frame.copy()
+
+    # ── Apply real redaction so the user sees production output ───────────
+    if plate_rects:
+        vis = apply_redaction(vis, plate_rects,
+                              mode=redact_mode,
+                              blur_strength=blur_strength,
+                              color=redact_color,
+                              overlay_img=overlay_img,
+                              padding=blur_padding)
+
+    # ── Vehicle boxes (blue) with track-aware rich tag ────────────────────
+    track_by_vidx = {}
+    ghost_tracks  = []
+    if tracker is not None:
+        for tr in tracker.tracks:
+            if tr.miss_count == 0:
+                # Find closest current vehicle box for labelling
+                best_vi, best_iou = None, 0.0
+                for vi, (_, vx1, vy1, vx2, vy2, _) in enumerate(all_vehicles):
+                    score = iou(tr.box, (vx1, vy1, vx2, vy2))
+                    if score > best_iou:
+                        best_iou, best_vi = score, vi
+                if best_vi is not None and best_iou > 0.1:
+                    track_by_vidx[best_vi] = tr
+            else:
+                ghost_tracks.append(tr)
+
+    for vi, (cls, x1, y1, x2, y2, conf) in enumerate(all_vehicles):
+        tr = track_by_vidx.get(vi)
+        if tr:
+            label = (f"{VEHICLE_CLASSES[cls]} {conf:.2f} | "
+                     f"#TRK{tr.id} age:{tr.frames_seen}f miss:{tr.miss_count}")
+        else:
+            label = f"{VEHICLE_CLASSES[cls]} {conf:.2f}"
+        cv2.rectangle(vis, (x1, y1), (x2, y2), _DD_BLUE, 2)
+        _dd_tag(vis, x1, y1, label, _DD_BLUE)
+
+    # ── Ghost tracks (detector missed this frame, tracker still holds) ────
+    for tr in ghost_tracks:
+        x1, y1, x2, y2 = tr.box
+        label = f"GHOST #{tr.id} gap {tr.miss_count}/{tracker.max_gap_frames}"
+        cv2.rectangle(vis, (x1, y1), (x2, y2), _DD_GHOST, 1)
+        _dd_tag(vis, x1, y1, label, _DD_GHOST, fs=0.45)
+
+    # ── Plate trajectory trails — fading cyan line per track ──────────────
+    if tracker is not None:
+        for tr in tracker.tracks:
+            if not tr.plate.has_history:
+                continue
+            # Use the centres of the recorded plate positions
+            pts = [(int(d[1]), int(d[2])) for d in tr.plate._data[-15:]]
+            for i in range(len(pts) - 1):
+                alpha = 0.25 + 0.75 * (i / max(1, len(pts) - 1))
+                c = tuple(int(v * alpha) for v in _DD_TRAIL)
+                cv2.line(vis, pts[i], pts[i+1], c, 2, cv2.LINE_AA)
+
+    # ── Plate boxes with source tag ───────────────────────────────────────
+    src_counts = {"sahi": 0, "crop": 0, "pred": 0, "own": 0}
+    for rect in plate_rects:
+        x1, y1, x2, y2 = rect[:4]
+        conf   = rect[4] if len(rect) > 4 else None
+        source = rect[5] if len(rect) > 5 else "sahi"
+        src_counts[source] = src_counts.get(source, 0) + 1
+        color = _DD_SOURCE_COLOR.get(source, _DD_GREEN)
+
+        if source == "pred":
+            _dd_dashed_rect(vis, x1, y1, x2, y2, color, thickness=2)
+            _dd_tag(vis, x1, y2 + 20, "PRED  gap-fill", color,
+                    fg_bgr=(0, 0, 0), fs=0.45)
+        else:
+            cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+            if conf is not None and conf >= 0:
+                _dd_tag(vis, x1, y1, f"{source.upper()} {conf:.2f}", color,
+                        fg_bgr=(0, 0, 0))
+            else:
+                _dd_tag(vis, x1, y1, source.upper(), color, fg_bgr=(0, 0, 0))
+
+    # ── Top status strip ──────────────────────────────────────────────────
+    strip_h = 38
+    cv2.rectangle(vis, (0, 0), (w, strip_h), _DD_VOID_BG, -1)
+    cv2.rectangle(vis, (0, strip_h - 1), (w, strip_h), _DD_BLUE, 1)
+    strip_text = (f"DEBUG DATA   VEH {len(all_vehicles)}   "
+                  f"PLT {len(plate_rects)} "
+                  f"(SAHI {src_counts['sahi']}, crop+ {src_counts['crop']}, "
+                  f"pred {src_counts['pred']}, own {src_counts['own']})")
+    cv2.putText(vis, strip_text, (12, 26),
+                cv2.FONT_HERSHEY_DUPLEX, 0.55, _DD_WHITE, 1, cv2.LINE_AA)
+
+    return vis
+
+
+def _dd_font(path, size, variation=None):
+    """Load PIL font; honours OpenType variation axes (e.g. Orbitron Bold)."""
+    from PIL import ImageFont
+    fnt = ImageFont.truetype(path, size)
+    if variation is not None:
+        try:
+            fnt.set_variation_by_name(variation)
+        except OSError:
+            pass
+    return fnt
+
+
+def draw_hud_panel(frame_h, telemetry):
+    """
+    DEBUG DATA - mode B.  Renders a 320×frame_h BGR side-panel with:
+      ULTRA-style header, FRAME / VEHICLES / PLATES / TRACKS sections and
+      a TIMINGS (ms) block.  Falls back to a Hershey-rendered panel if the
+      brand TTFs aren't installed locally.
+    """
+    if not _dd_have_pil_fonts():
+        return _draw_hud_panel_fallback(frame_h, telemetry)
+
+    from PIL import Image, ImageDraw
+
+    hud = np.full((frame_h, _DD_HUD_W, 3), _DD_HUD_BG, dtype=np.uint8)
+    # Left-edge accent bar (Data Blue)
+    cv2.rectangle(hud, (0, 0), (3, frame_h), _DD_BLUE, -1)
+
+    pil = Image.fromarray(cv2.cvtColor(hud, cv2.COLOR_BGR2RGB)).convert("RGBA")
+    over = Image.new("RGBA", pil.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(over)
+
+    fnt_display = _dd_font(_DD_F_DISP,  22, "Bold")
+    fnt_body    = _dd_font(_DD_F_BODY,  20)
+    fnt_mono    = _dd_font(_DD_F_MONO,  17)
+    fnt_mono_b  = _dd_font(_DD_F_MONOB, 22)
+    fnt_small   = _dd_font(_DD_F_DISP,  14, "Bold")
+
+    # Cursor (vertical) and helpers — use a mutable container so nested fns
+    # can advance the cursor without leaning on `nonlocal`.
+    x0   = 18
+    yp   = [18]
+
+    # PIL uses RGB so colours need a flip from our BGR brand constants.
+    def _rgb(bgr): return (bgr[2], bgr[1], bgr[0])
+    BLUE_RGB  = _rgb(_DD_BLUE)  + (255,)
+    RED_RGB   = _rgb(_DD_RED)   + (255,)
+    WHITE_RGB = _rgb(_DD_WHITE) + (255,)
+    DIM_RGB   = _rgb(_DD_DIM)   + (255,)
+    GREEN_RGB = _rgb(_DD_GREEN) + (255,)
+
+    def section(title, color):
+        draw.text((x0, yp[0]), title, font=fnt_body, fill=color)
+        yp[0] += 24
+
+    def kv(label, value, value_color=WHITE_RGB):
+        draw.text((x0, yp[0]),       label, font=fnt_mono,   fill=DIM_RGB)
+        draw.text((x0 + 120, yp[0]), value, font=fnt_mono_b, fill=value_color)
+        yp[0] += 22
+
+    def bar(label, val_ms, max_ms, color):
+        draw.text((x0,         yp[0]),     label,           font=fnt_mono,   fill=DIM_RGB)
+        draw.text((x0 + 230,   yp[0] - 1), f"{val_ms:5.0f}", font=fnt_mono_b, fill=WHITE_RGB)
+        bx, by, bw_, bh_ = x0 + 70, yp[0] + 5, 150, 10
+        draw.rectangle([(bx, by), (bx + bw_, by + bh_)], fill=(40, 40, 50, 255))
+        fill_w = int(bw_ * min(1.0, val_ms / max_ms))
+        draw.rectangle([(bx, by), (bx + fill_w, by + bh_)], fill=color)
+        yp[0] += 22
+
+    # ── Header ─────────────────────────────────────────────────────────────
+    draw.text((x0, yp[0]), "DEBUG  DATA", font=fnt_display, fill=WHITE_RGB)
+    yp[0] += 32
+    draw.rectangle([(x0, yp[0]), (_DD_HUD_W - 18, yp[0] + 2)], fill=BLUE_RGB)
+    yp[0] += 18
+
+    # ── FRAME ─────────────────────────────────────────────────────────────
+    section("FRAME", BLUE_RGB)
+    frame_idx    = telemetry.get("frame_num", 0)
+    total_frames = telemetry.get("total_frames", 0)
+    fps_target   = telemetry.get("fps_target", 30.0)
+    timings      = telemetry.get("timings", {})
+    ts_sec       = frame_idx / fps_target if fps_target else 0
+    ts_min, ts_s = divmod(ts_sec, 60)
+    total_ms     = sum(timings.values()) if timings else 0
+    inst_fps     = (1000.0 / total_ms) if total_ms > 0 else 0
+    kv("idx",  f"{frame_idx:05d} / {total_frames}")
+    kv("time", f"{int(ts_min):02d}:{ts_s:06.3f}")
+    kv("fps",  f"{inst_fps:5.1f}",
+       value_color=GREEN_RGB if inst_fps >= fps_target * 0.5 else RED_RGB)
+    yp[0] += 8
+
+    # ── VEHICLES ──────────────────────────────────────────────────────────
+    vehicles = telemetry.get("vehicles", [])
+    tracks   = telemetry.get("tracks", [])
+    section("VEHICLES", BLUE_RGB)
+    kv("found",   f"{len(vehicles)}")
+    kv("tracked", f"{len(tracks)}")
+    yp[0] += 8
+
+    # ── PLATES ────────────────────────────────────────────────────────────
+    plates = telemetry.get("plates", [])
+    by_src = {"sahi": 0, "crop": 0, "pred": 0, "own": 0}
+    for r in plates:
+        s = r[5] if len(r) > 5 else "sahi"
+        by_src[s] = by_src.get(s, 0) + 1
+    section("PLATES", BLUE_RGB)
+    kv("SAHI",  f"{by_src['sahi']}",
+       value_color=WHITE_RGB if by_src["sahi"] else DIM_RGB)
+    kv("crop+", f"{by_src['crop']}",
+       value_color=WHITE_RGB if by_src["crop"] else DIM_RGB)
+    kv("pred",  f"{by_src['pred']}",
+       value_color=WHITE_RGB if by_src["pred"] else DIM_RGB)
+    kv("own",   f"{by_src['own']}",
+       value_color=WHITE_RGB if by_src["own"] else DIM_RGB)
+    yp[0] += 8
+
+    # ── TRACKS list (up to 6 rows) ────────────────────────────────────────
+    section("TRACKS", RED_RGB)
+    if not tracks:
+        draw.text((x0, yp[0]), "—  no active tracks",
+                  font=fnt_mono, fill=DIM_RGB)
+        yp[0] += 24
+    else:
+        for tr in tracks[:6]:
+            draw.text((x0,        yp[0]), f"#{tr.id}",
+                      font=fnt_mono_b, fill=WHITE_RGB)
+            draw.text((x0 + 50,   yp[0]),
+                      f"age {tr.frames_seen}f",
+                      font=fnt_mono, fill=(180, 180, 200, 255))
+            draw.text((x0 + 165,  yp[0]),
+                      f"miss {tr.miss_count}",
+                      font=fnt_mono, fill=(180, 180, 200, 255))
+            yp[0] += 22
+        if len(tracks) > 6:
+            draw.text((x0, yp[0]), f"+ {len(tracks) - 6} more...",
+                      font=fnt_mono, fill=DIM_RGB)
+            yp[0] += 22
+    yp[0] += 4
+
+    # ── TIMINGS (ms) ──────────────────────────────────────────────────────
+    section("TIMINGS (ms)", RED_RGB)
+    detect_ms = timings.get("detect", 0)
+    track_ms  = timings.get("track",  0)
+    render_ms = timings.get("render", 0)
+    max_ms    = max(60.0, detect_ms * 1.1)
+    bar("detect", detect_ms, max_ms, RED_RGB)
+    bar("track",  track_ms,  max_ms, RED_RGB)
+    bar("render", render_ms, max_ms, RED_RGB)
+    yp[0] += 4
+    draw.rectangle([(x0, yp[0]), (_DD_HUD_W - 18, yp[0] + 1)],
+                   fill=(70, 70, 80, 255))
+    yp[0] += 8
+    bar("TOTAL",  total_ms, max(80.0, total_ms * 1.1), BLUE_RGB)
+
+    # ── Footer ────────────────────────────────────────────────────────────
+    draw.text((x0, frame_h - 30), "DSDT.X / AI VISION",
+              font=fnt_small, fill=DIM_RGB)
+
+    pil.alpha_composite(over)
+    return cv2.cvtColor(np.array(pil.convert("RGB")), cv2.COLOR_RGB2BGR)
+
+
+def _draw_hud_panel_fallback(frame_h, telemetry):
+    """OpenCV-only HUD when brand TTFs aren't available."""
+    hud = np.full((frame_h, _DD_HUD_W, 3), _DD_HUD_BG, dtype=np.uint8)
+    cv2.rectangle(hud, (0, 0), (3, frame_h), _DD_BLUE, -1)
+    y = 30
+    cv2.putText(hud, "DEBUG DATA", (18, y), cv2.FONT_HERSHEY_DUPLEX, 0.9,
+                _DD_WHITE, 2, cv2.LINE_AA)
+    y += 26
+    cv2.line(hud, (18, y), (_DD_HUD_W - 18, y), _DD_BLUE, 2); y += 18
+
+    timings = telemetry.get("timings", {})
+    total_ms = sum(timings.values()) if timings else 0
+    for line in (
+        f"frame  {telemetry.get('frame_num', 0):>5d}/{telemetry.get('total_frames', 0)}",
+        f"VEH    {len(telemetry.get('vehicles', []))}",
+        f"PLT    {len(telemetry.get('plates', []))}",
+        f"TRK    {len(telemetry.get('tracks', []))}",
+        "",
+        f"detect {timings.get('detect', 0):6.1f} ms",
+        f"track  {timings.get('track',  0):6.1f} ms",
+        f"render {timings.get('render', 0):6.1f} ms",
+        f"TOTAL  {total_ms:6.1f} ms",
+    ):
+        cv2.putText(hud, line, (18, y), cv2.FONT_HERSHEY_DUPLEX, 0.55,
+                    _DD_WHITE, 1, cv2.LINE_AA)
+        y += 24
+    return hud
+
+
 def blur_license_plates(
     input_path: str,
     output_path: str,
@@ -1450,6 +1814,8 @@ def blur_license_plates(
     preset: str = "medium",
     tmp_dir: str = "auto",
     debug: bool = False,
+    debug_overlay: bool = False,   # extended in-frame overlay (DEBUG DATA mode)
+    debug_hud: bool = False,       # side HUD panel (DEBUG DATA mode)
     tracking_enabled: bool = True,
     max_gap_frames: int = 8,
     history_frames: int = 15,
@@ -1532,6 +1898,12 @@ def blur_license_plates(
     frame_size     = width * height * 3
     total_frames   = estimate_frame_count(info, start_time, end_time)
 
+    # When the HUD side-panel is enabled, output frames are wider than input.
+    # The encoder is told this widened size; ffmpeg's `-s WxH` reads the raw
+    # buffer at the new dimensions so the side panel survives encoding.
+    enc_width  = width + _DD_HUD_W if debug_hud else width
+    enc_height = height
+
     os.makedirs(tmp_dir, exist_ok=True)
     with tempfile.NamedTemporaryFile(suffix=".mkv", delete=False, dir=tmp_dir) as tmp:
         tmp_path = tmp.name
@@ -1557,7 +1929,7 @@ def blur_license_plates(
                 video_codec = None   # None → build_ffmpeg_extract uses software path
 
         extract_cmd = build_ffmpeg_extract(input_path, start_time, end_time, codec=video_codec)
-        encode_cmd  = build_ffmpeg_encode_lossless(width, height, fps, tmp_path)
+        encode_cmd  = build_ffmpeg_encode_lossless(enc_width, enc_height, fps, tmp_path)
 
         extract_proc = subprocess.Popen(extract_cmd, stdout=subprocess.PIPE,
                                         stderr=subprocess.DEVNULL)
@@ -1580,6 +1952,11 @@ def blur_license_plates(
                     frame = np.frombuffer(raw, dtype=np.uint8).reshape(
                         (height, width, 3)).copy()
 
+                    # Per-frame timing dict for the debug HUD's TIMINGS bars.
+                    # Each stage is wrapped with perf_counter() deltas in ms.
+                    timings = {}
+                    _t0 = time.perf_counter()
+
                     suppressed_plates = []   # reset each frame; populated by tracker or dedup
                     plates, vehicles = detect_plates(
                         frame, vehicle_model, plate_model,
@@ -1595,6 +1972,9 @@ def blur_license_plates(
                         sharpen_sigma=sharpen_sigma,
                         vehicle_crop_scale=vehicle_crop_scale,
                     )
+
+                    timings["detect"] = (time.perf_counter() - _t0) * 1000
+                    _t1 = time.perf_counter()
 
                     filter_classes  = VEHICLE_FILTER_MAP.get(vehicle_filter, set(VEHICLE_CLASSES))
                     vehicle_boxes   = [(v[1], v[2], v[3], v[4]) for v in vehicles
@@ -1622,13 +2002,29 @@ def blur_license_plates(
                         plates = ar_filtered
 
                     # Always include own-plate region
+                    timings["track"] = (time.perf_counter() - _t1) * 1000
+                    _t2 = time.perf_counter()
+
                     if own_plate_region:
-                        plates = list(plates) + [own_plate_region]
+                        # Tag own-plate with conf 1.0 and source 'own' so the
+                        # debug overlay can label / colour it distinctly.
+                        own_with_source = (*own_plate_region, 1.0, "own")
+                        plates = list(plates) + [own_with_source]
 
                     if plates:
                         total_plates += len(plates)
 
-                    if debug:
+                    if debug_overlay:
+                        frame = draw_extended_overlay(
+                            frame, plates, vehicles,
+                            tracker=tracker,
+                            blur_padding=blur_padding,
+                            blur_strength=blur_strength,
+                            redact_mode=redact_mode,
+                            redact_color=redact_color,
+                            overlay_img=overlay_img,
+                        )
+                    elif debug:
                         frame = draw_debug_overlay(frame, plates, vehicles,
                                                    own_plate_region=own_plate_region,
                                                    blur_padding=blur_padding,
@@ -1645,6 +2041,24 @@ def blur_license_plates(
                                                 color=redact_color,
                                                 overlay_img=overlay_img,
                                                 padding=blur_padding)
+
+                    timings["render"] = (time.perf_counter() - _t2) * 1000
+
+                    # HUD side panel (DEBUG DATA mode B) — appended to the right
+                    if debug_hud:
+                        hud = draw_hud_panel(
+                            frame_h    = frame.shape[0],
+                            telemetry  = {
+                                "frame_num"   : frame_num,
+                                "total_frames": total_frames,
+                                "fps_target"  : fps,
+                                "vehicles"    : vehicles,
+                                "plates"      : plates,
+                                "tracks"      : tracker.tracks if tracker else [],
+                                "timings"     : timings,
+                            },
+                        )
+                        frame = np.concatenate([frame, hud], axis=1)
 
                     encode_proc.stdin.write(frame.tobytes())
                     frame_num += 1
@@ -1753,6 +2167,15 @@ Examples:
     parser.add_argument("--debug", action="store_true",
                         help="Write detection overlay video instead of blurring "
                              "(blue=vehicles, green=plate regions, orange=own plate)")
+    parser.add_argument("--debug-overlay", dest="debug_overlay",
+                        action="store_true",
+                        help="DEBUG DATA mode (A): rich in-frame overlay with source "
+                             "tags (SAHI/crop+/pred), trajectory trails and ghost "
+                             "boxes for tracked vehicles whose detector missed.")
+    parser.add_argument("--debug-hud", dest="debug_hud", action="store_true",
+                        help="DEBUG DATA mode (B): add a brand-styled side panel "
+                             "with frame#, counts, track list and per-stage timings. "
+                             "Output video gets wider by ~320 px.")
     parser.add_argument("--detect-scale", dest="detect_scale", type=float,
                         default=float(det.get("detect_scale", 1.0)),
                         help="Fraction of resolution used for detection (default: "
@@ -1814,6 +2237,8 @@ Examples:
         preset=out["preset"],
         tmp_dir=out["tmp_dir"],
         debug=args.debug,
+        debug_overlay=args.debug_overlay,
+        debug_hud=args.debug_hud,
         tracking_enabled=bool(trk.get("enabled", True)),
         max_gap_frames=int(trk.get("max_gap_frames", 8)),
         history_frames=int(trk.get("history_frames", 15)),

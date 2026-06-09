@@ -145,6 +145,12 @@ python blur_plates.py input.mp4 output.mp4 --own-plate 1700,900,2200,1100
 # Debug mode — draws detection boxes instead of blurring (blue=vehicle, green=plate)
 python blur_plates.py input.mp4 debug.mp4 --debug
 
+# DEBUG DATA — extended in-frame overlay with source tags & trajectory trails
+python blur_plates.py input.mp4 debug.mp4 --debug-overlay
+
+# DEBUG DATA — add a side-panel HUD with frame/track/timing telemetry
+python blur_plates.py input.mp4 debug.mp4 --debug-overlay --debug-hud
+
 # Replace plates with a solid colour (R,G,B) instead of blurring
 python blur_plates.py input.mp4 output.mp4 --mode color --color 0,0,0
 
@@ -184,6 +190,8 @@ python batch_blur.py /path/to/folder --outdir /path/to/output --vehicles motorbi
 | `--start` / `--end` | — | Process a time range (`MM:SS` or `HH:MM:SS`) |
 | `--own-plate` | — | Fixed region to always blur (`x1,y1,x2,y2`) |
 | `--debug` | off | Overlay detection boxes instead of blurring |
+| `--debug-overlay` | off | DEBUG DATA mode (A): rich in-frame overlay with source tags (SAHI/crop+/pred), trajectory trails, ghost tracks |
+| `--debug-hud` | off | DEBUG DATA mode (B): brand-styled side panel with frame#, counts, track list, per-stage timings (output gets +320 px wider) |
 | `--mode` | `blur` | Redaction style: `blur`, `color`, or `image` |
 | `--color` | `0,0,0` | Solid fill colour for `--mode color` (R,G,B) |
 | `--image` | — | Path to overlay image for `--mode image` (PNG with alpha supported) |
