@@ -170,9 +170,9 @@ def detect_plates(frame, vehicle_model, plate_model, device="cpu", vehicle_conf=
                   vehicle_filter="all", plate_conf=0.15, plate_conf_in_vehicle=0.07,
                   sahi_slice_size=640, sahi_overlap=0.2, detect_scale=1.0,
                   sharpen=False, sharpen_amount=1.5, sharpen_sigma=1.0,
-                  vehicle_crop_scale=1.0):
+                  vehicle_crop_scale=1.0, collect_rejected=False):
     """
-    Returns (plate_rects, all_vehicles) where:
+    Returns (plate_rects, all_vehicles, rejected) where:
       plate_rects  — list of (x1, y1, x2, y2, conf) regions to blur
       all_vehicles — list of (cls_id, x1, y1, x2, y2, conf) for every detected vehicle
 
@@ -198,6 +198,13 @@ def detect_plates(frame, vehicle_model, plate_model, device="cpu", vehicle_conf=
       30 px wide become 60–90 px wide, dramatically improving confidence on
       distant or small vehicles.  Results are merged with the SAHI pass.
       1.0 = disabled (default).  2.0 is recommended when enabling.
+
+    collect_rejected:
+      When True, below-threshold detections are collected into `rejected`
+      (tagged source 'rejected') instead of being silently dropped, so the
+      debug overlay can draw them.  Adds no inference cost — the model already
+      runs at the lowest threshold; this only changes a `continue` into an
+      append.  Defaults False so production output is byte-for-byte unchanged.
     """
     h, w = frame.shape[:2]
     scale = DETECT_WIDTH / w
@@ -258,6 +265,7 @@ def detect_plates(frame, vehicle_model, plate_model, device="cpu", vehicle_conf=
 
     # ── Step 3: context-aware confidence filtering ────────────────────────────
     plate_rects = []
+    rejected    = []   # below-threshold detections (only populated if collect_rejected)
     for det in result.object_prediction_list:
         x1, y1 = int(det.bbox.minx), int(det.bbox.miny)
         x2, y2 = int(det.bbox.maxx), int(det.bbox.maxy)
@@ -272,6 +280,12 @@ def detect_plates(frame, vehicle_model, plate_model, device="cpu", vehicle_conf=
 
         required = plate_conf_in_vehicle if in_vehicle else plate_conf
         if conf < required:
+            if collect_rejected:
+                rejected.append((
+                    int(x1 * coord_scale), int(y1 * coord_scale),
+                    int(x2 * coord_scale), int(y2 * coord_scale),
+                    conf, "rejected",
+                ))
             continue
 
         # Scale coords back to full-resolution space.
@@ -327,19 +341,22 @@ def detect_plates(frame, vehicle_model, plate_model, device="cpu", vehicle_conf=
                     continue
                 for box in r.boxes:
                     c = float(box.conf[0])
-                    if c < plate_conf_in_vehicle:   # all crop plates are "in vehicle"
-                        continue
                     px1, py1, px2, py2 = map(int, box.xyxy[0].tolist())
                     # Map from upscaled-crop space → original-frame space
                     ox1 = cx1 + int(px1 * inv_crop)
                     oy1 = cy1 + int(py1 * inv_crop)
                     ox2 = cx1 + int(px2 * inv_crop)
                     oy2 = cy1 + int(py2 * inv_crop)
-                    if ox2 > ox1 and oy2 > oy1:
-                        plate_rects.append((ox1, oy1, ox2, oy2, c, "crop"))
+                    if ox2 <= ox1 or oy2 <= oy1:
+                        continue
+                    if c < plate_conf_in_vehicle:   # all crop plates are "in vehicle"
+                        if collect_rejected:
+                            rejected.append((ox1, oy1, ox2, oy2, c, "rejected"))
+                        continue
+                    plate_rects.append((ox1, oy1, ox2, oy2, c, "crop"))
 
     # ── Step 4: dedup ─────────────────────────────────────────────────────────
-    return merge_overlapping(plate_rects), all_vehicles
+    return merge_overlapping(plate_rects), all_vehicles, rejected
 
 
 # ─── Batch / GPU-parallel detection ──────────────────────────────────────────
@@ -392,7 +409,7 @@ def detect_plates_batched(frames, vehicle_model, plate_model, device,
     Falls back to single-frame detect_plates() when len(frames) == 1.
     """
     if len(frames) == 1:
-        r, v = detect_plates(
+        r, v, _ = detect_plates(
             frames[0], vehicle_model, plate_model, device,
             vehicle_conf=vehicle_conf, vehicle_filter=vehicle_filter,
             plate_conf=plate_conf, plate_conf_in_vehicle=plate_conf_in_vehicle,
@@ -726,7 +743,7 @@ def _print_run_summary(*, elapsed_total, elapsed_process, device, info,
     print(f"  Input          :  {in_name}")
     print(f"                    {res} @ {in_fps:.2f} fps  |  {in_codec}  |  {_format_duration(in_dur)}")
     print(f"  Output         :  {out_name}")
-    print(f"                    {out_size:.1f} MB  |  HEVC (lossless intermediate → CRF 0)")
+    print(f"                    {out_size:.1f} MB  |  HEVC (lossless intermediate → visually lossless mux)")
     print(f"  Redaction      :  {mode_desc}")
     if vehicle_filter and vehicle_filter != "all":
         print(f"  Vehicle filter :  {vehicle_filter} only")
@@ -833,9 +850,56 @@ def _ffmpeg_with_progress(cmd, total_frames, desc="  Encoding"):
     return proc.returncode, "".join(stderr_lines)
 
 
+def _source_color_args(source_path):
+    """
+    Probe the source video for color metadata (primaries, transfer, space,
+    range) and return ffmpeg flags that preserve it on the output.
+
+    Without this, the raw-BGR pipe in the middle of the pipeline strips all
+    colorimetry — leaving the final encoded HEVC with color_primaries=unknown
+    etc.  Different players then guess different colorspaces, which is exactly
+    the colour-shift artefact users see on iPhone footage (BT.709 source ←→
+    BT.601 default-guess).
+    """
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries",
+             "stream=color_primaries,color_transfer,color_space,color_range",
+             "-of", "default=nw=1:nk=0", source_path],
+            capture_output=True, text=True, check=True
+        ).stdout
+    except subprocess.CalledProcessError:
+        return []
+    # Parse key=value pairs (order from ffprobe is alphabetical, not request order).
+    fields = {}
+    for line in out.splitlines():
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        fields[k.strip()] = v.strip()
+
+    args = []
+    primaries = fields.get("color_primaries", "")
+    transfer  = fields.get("color_transfer",  "")
+    space     = fields.get("color_space",     "")
+    rng       = fields.get("color_range",     "")
+    if primaries and primaries != "unknown":
+        args += ["-color_primaries", primaries]
+    if transfer and transfer != "unknown":
+        args += ["-color_trc", transfer]
+    if space and space != "unknown":
+        args += ["-colorspace", space]
+    if rng and rng != "unknown":
+        # ffmpeg's -color_range only accepts 'tv'/'pc' (or 1/2), not 'mpeg'/'jpeg'
+        # — both refer to the same thing; pass the ffprobe label through as-is.
+        args += ["-color_range", rng]
+    return args
+
+
 def mux_audio(video_only_path, original_path, output_path,
               start_sec, end_sec, fps, total_frames=None,
-              preset="medium", tmp_dir="D:/pip-tmp"):
+              preset="medium", tmp_dir="D:/pip-tmp", quality=18):
     """
     Combine processed video with original audio.
     Audio is extracted to a temp file first (resets timestamps to 0)
@@ -872,23 +936,35 @@ def mux_audio(video_only_path, original_path, output_path,
                 capture_output=True)
             return r.returncode == 0
 
+        # Capture source colorimetry so we can re-tag the output with the same
+        # BT.709 (or whatever the source had) values.  The raw-BGR pipe strips
+        # this metadata mid-pipeline and players have to guess otherwise.
+        color_args = _source_color_args(original_path)
+
         if _nvenc_available():
             video_codec_args = [
                 "-c:v", "hevc_nvenc",
-                "-rc", "constqp",   # constant quantiser (closest to lossless)
-                "-qp", "0",         # QP 0 = maximum quality
-                "-preset", "p1",    # p1=fastest … p7=slowest (GPU-side)
+                # Visually-lossless constant quality.  QP 0 used to produce
+                # ~400 Mbps output that many players refused to open or froze
+                # mid-playback; cq 18 is indistinguishable to the eye and
+                # ~10× smaller.
+                "-rc", "vbr",
+                "-cq", str(quality),
+                "-preset", "p4",    # p1=fastest … p7=slowest (GPU-side)
+                "-bf", "0",         # match iPhone source (no B-frames)
                 "-tag:v", "hvc1",   # QuickTime / macOS compatible
                 "-pix_fmt", "yuv420p",
+                *color_args,
             ]
             enc_label = "  Encoding (HEVC NVENC GPU + audio)"
         else:
             video_codec_args = [
                 "-c:v", "libx265",
-                "-crf", "0",        # lossless HEVC
+                "-crf", str(quality),   # visually lossless, ~10× smaller than crf 0
                 "-preset", preset,
                 "-tag:v", "hvc1",
                 "-pix_fmt", "yuv420p",
+                *color_args,
             ]
             enc_label = "  Encoding (HEVC CPU + audio)"
 
@@ -1506,7 +1582,7 @@ def _dd_dashed_rect(img, x1, y1, x2, y2, color, thickness=2, dash=8, gap=4):
 def draw_extended_overlay(frame, plate_rects, all_vehicles, tracker=None,
                           blur_padding=8, blur_strength=61,
                           redact_mode="blur", redact_color=(0, 0, 0),
-                          overlay_img=None):
+                          overlay_img=None, rejected_plates=None):
     """
     DEBUG DATA - mode A.  Returns a frame with the actual redaction applied
     plus rich annotations: source-tagged plate boxes, vehicle boxes with
@@ -1524,6 +1600,15 @@ def draw_extended_overlay(frame, plate_rects, all_vehicles, tracker=None,
                               color=redact_color,
                               overlay_img=overlay_img,
                               padding=blur_padding)
+
+    # ── Rejected detections (grey, dashed) — below confidence threshold ───
+    # Drawn first so accepted/predicted boxes render on top of them.
+    for rect in (rejected_plates or []):
+        x1, y1, x2, y2 = rect[:4]
+        conf = rect[4] if len(rect) > 4 else None
+        _dd_dashed_rect(vis, x1, y1, x2, y2, _DD_GHOST, thickness=1)
+        label = f"REJ {conf:.2f}" if conf is not None else "REJ"
+        _dd_tag(vis, x1, y1, label, _DD_GHOST, fs=0.4)
 
     # ── Vehicle boxes (blue) with track-aware rich tag ────────────────────
     track_by_vidx = {}
@@ -1599,7 +1684,8 @@ def draw_extended_overlay(frame, plate_rects, all_vehicles, tracker=None,
     strip_text = (f"DEBUG DATA   VEH {len(all_vehicles)}   "
                   f"PLT {len(plate_rects)} "
                   f"(SAHI {src_counts['sahi']}, crop+ {src_counts['crop']}, "
-                  f"pred {src_counts['pred']}, own {src_counts['own']})")
+                  f"pred {src_counts['pred']}, own {src_counts['own']})   "
+                  f"REJ {len(rejected_plates or [])}")
     cv2.putText(vis, strip_text, (12, 26),
                 cv2.FONT_HERSHEY_DUPLEX, 0.55, _DD_WHITE, 1, cv2.LINE_AA)
 
@@ -1812,6 +1898,7 @@ def blur_license_plates(
     own_plate_region: tuple = None,
     vehicle_filter: str = "all",
     preset: str = "medium",
+    quality: int = 18,            # final HEVC quality (CRF / CQ) — see config.toml
     tmp_dir: str = "auto",
     debug: bool = False,
     debug_overlay: bool = False,   # extended in-frame overlay (DEBUG DATA mode)
@@ -1958,7 +2045,7 @@ def blur_license_plates(
                     _t0 = time.perf_counter()
 
                     suppressed_plates = []   # reset each frame; populated by tracker or dedup
-                    plates, vehicles = detect_plates(
+                    plates, vehicles, rejected_plates = detect_plates(
                         frame, vehicle_model, plate_model,
                         vehicle_conf=vehicle_conf,
                         vehicle_filter=vehicle_filter,
@@ -1971,6 +2058,7 @@ def blur_license_plates(
                         sharpen_amount=sharpen_amount,
                         sharpen_sigma=sharpen_sigma,
                         vehicle_crop_scale=vehicle_crop_scale,
+                        collect_rejected=debug_overlay,
                     )
 
                     timings["detect"] = (time.perf_counter() - _t0) * 1000
@@ -2023,6 +2111,7 @@ def blur_license_plates(
                             redact_mode=redact_mode,
                             redact_color=redact_color,
                             overlay_img=overlay_img,
+                            rejected_plates=rejected_plates,
                         )
                     elif debug:
                         frame = draw_debug_overlay(frame, plates, vehicles,
@@ -2082,7 +2171,8 @@ def blur_license_plates(
         print("  Encoding final output (lossless HEVC + audio sync fix)...")
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
         mux_audio(tmp_path, input_path, output_path, start_time, end_time, fps,
-                  total_frames=frame_num, preset=preset, tmp_dir=tmp_dir)
+                  total_frames=frame_num, preset=preset, tmp_dir=tmp_dir,
+                  quality=quality)
 
         # End-of-run summary: hardware, timing, throughput, mode, settings.
         _elapsed_total = time.perf_counter() - _run_start_ts
@@ -2235,6 +2325,7 @@ Examples:
         own_plate_region=own_plate,
         vehicle_filter=args.vehicles,
         preset=out["preset"],
+        quality=int(out.get("quality", 18)),
         tmp_dir=out["tmp_dir"],
         debug=args.debug,
         debug_overlay=args.debug_overlay,

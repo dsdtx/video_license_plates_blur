@@ -127,6 +127,14 @@ image = ""
 # libx265 preset for final HEVC encode (ultrafast / fast / medium / slow)
 preset = "medium"
 
+# Final HEVC quality — used as CRF on libx265 and as CQ on hevc_nvenc.
+# Lower numbers = higher quality + larger files. Sensible range:
+#   0  = truly lossless (HUGE files, often unplayable in non-pro players)
+#   18 = visually lossless (default, ~5-15% the size of qp 0)
+#   23 = near-broadcast quality, ~3-5× smaller
+#   28 = noticeable compression, smallest reasonable size
+quality = 18
+
 # Directory for temporary lossless intermediate files (needs ~2x input size free).
 # "auto" picks the OS temp dir at runtime (e.g. /tmp on Linux/macOS,
 # %TEMP% on Windows). Set an explicit path to use a specific drive/location.
