@@ -861,11 +861,18 @@ def build_ffmpeg_encode_lossless(width, height, fps, out_path):
 
 
 def _ffmpeg_encoder_available(encoder: str) -> bool:
-    """True if the named ffmpeg video encoder can be initialised on this machine."""
-    r = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-f", "lavfi", "-i", "nullsrc",
-         "-t", "0", "-c:v", encoder, "-f", "null", "-"],
-        capture_output=True)
+    """True if the named ffmpeg video encoder can be initialised on this machine.
+
+    Returns False (rather than raising) if ffmpeg itself is not on PATH, so callers
+    fall back to the portable CPU encoder instead of crashing during a probe.
+    """
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-f", "lavfi", "-i", "nullsrc",
+             "-t", "0", "-c:v", encoder, "-f", "null", "-"],
+            capture_output=True)
+    except FileNotFoundError:
+        return False
     return r.returncode == 0
 
 
