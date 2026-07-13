@@ -156,6 +156,12 @@ python blur_plates.py input.mp4 output.mp4 --mode color --color 0,0,0
 
 # Stamp a custom image (logo / sticker / portrait) onto every plate
 python blur_plates.py input.mp4 output.mp4 --mode image --image my_sticker.png
+
+# Export a luma matte (ProRes .mov) — original footage stays untouched
+python blur_plates.py input.mp4 matte.mov --mode matte
+
+# Soft-edged matte + HEVC .mp4 (GPU-accelerated on NVIDIA PCs)
+python blur_plates.py input.mp4 matte.mp4 --mode matte --matte-codec hevc --matte-feather 8
 ```
 
 ### Redaction modes
@@ -165,9 +171,29 @@ python blur_plates.py input.mp4 output.mp4 --mode image --image my_sticker.png
 | `blur` (default) | Strong Gaussian blur | `--blur N` for kernel size |
 | `color` | Solid colour fill | `--color R,G,B` (0-255 each) |
 | `image` | A PNG/JPG stretched to fill the plate. PNG alpha is honoured. | `--image PATH` |
+| `matte` | Nothing — exports a **white-on-black luma matte** instead; the footage is left untouched so you composite the blur/mosaic yourself in Premiere/DaVinci | `--matte-codec prores\|hevc`, `--matte-feather N` |
 
 The selected mode applies to **every plate** in the output, including the
 `--own-plate` fixed region — so the result has a consistent look.
+
+#### Matte mode — keep your master pristine
+
+`--mode matte` runs the same detection and tracking, but instead of baking a blur
+into a full re-encode of your footage it outputs a **luma matte** (plates white,
+everything else black) matched frame-for-frame to the source. Keep your original
+high-quality master (e.g. a 4K ProRes edit) untouched and drive a blur/mosaic
+through the matte as a Track Matte Key (Premiere) or external matte (DaVinci). This
+avoids re-encoding the picture at all, and — because the matte is synthetic — a
+matte run is typically **faster** than a blur run.
+
+- **Codec** (`--matte-codec`): `prores` (default) writes ProRes 422 HQ `.mov`,
+  hardware-accelerated on Apple Silicon and CPU-encoded elsewhere; `hevc` writes a
+  near-lossless HEVC `.mp4`, GPU-accelerated via NVENC on NVIDIA PCs — the faster
+  option where CPU ProRes is a bottleneck. (There is no GPU ProRes encoder on PC.)
+- **Edges** (`--matte-feather N`): `0` (default) gives hard-edged boxes you feather
+  in your NLE; `N > 0` bakes a soft Gaussian falloff into the matte.
+- The matte is written **full-range** (white = 255) with no audio, and honours
+  `--start`/`--end`, `--own-plate`, `--vehicles`, and all detection settings.
 
 Defaults for these flags can also be set in `config.toml` under the `[redact]`
 section so you don't have to pass them every time.
@@ -192,9 +218,11 @@ python batch_blur.py /path/to/folder --outdir /path/to/output --vehicles motorbi
 | `--debug` | off | Overlay detection boxes instead of blurring |
 | `--debug-overlay` | off | DEBUG DATA mode (A): rich in-frame overlay with source tags (SAHI/crop+/pred), trajectory trails, ghost tracks |
 | `--debug-hud` | off | DEBUG DATA mode (B): brand-styled side panel with frame#, counts, track list, per-stage timings (output gets +320 px wider) |
-| `--mode` | `blur` | Redaction style: `blur`, `color`, or `image` |
+| `--mode` | `blur` | Redaction style: `blur`, `color`, `image`, or `matte` |
 | `--color` | `0,0,0` | Solid fill colour for `--mode color` (R,G,B) |
 | `--image` | — | Path to overlay image for `--mode image` (PNG with alpha supported) |
+| `--matte-codec` | `prores` | For `--mode matte`: `prores` (.mov) or `hevc` (.mp4) |
+| `--matte-feather` | `0` | For `--mode matte`: edge-softening radius in px |
 
 ---
 
