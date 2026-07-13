@@ -2015,9 +2015,15 @@ def blur_license_plates(
     redact_mode: str = "blur",
     redact_color: tuple = (0, 0, 0),
     redact_image_path: str = None,
+    matte_feather: int = 0,
+    matte_codec: str = "prores",
 ):
     if tmp_dir == "auto":
         tmp_dir = os.path.join(tempfile.gettempdir(), "plate-blur-tmp")
+
+    # Matte mode dictates the container; correct the extension before we print it.
+    if redact_mode == "matte":
+        output_path = resolve_matte_output_path(output_path, matte_codec)
     # Capture wall-clock start so we can report total + processing-only time
     # at the end. Uses a different name from the `start_time` parameter (which
     # is the video trim start, not a timestamp).
@@ -2113,7 +2119,17 @@ def blur_license_plates(
                 video_codec = None   # None → build_ffmpeg_extract uses software path
 
         extract_cmd = build_ffmpeg_extract(input_path, start_time, end_time, codec=video_codec)
-        encode_cmd  = build_ffmpeg_encode_lossless(enc_width, enc_height, fps, tmp_path)
+        if redact_mode == "matte":
+            if matte_codec == "hevc":
+                encode_cmd = build_ffmpeg_encode_hevc_matte(
+                    enc_width, enc_height, fps, output_path)
+            else:
+                encode_cmd = build_ffmpeg_encode_prores(
+                    enc_width, enc_height, fps, output_path)
+            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        else:
+            encode_cmd = build_ffmpeg_encode_lossless(
+                enc_width, enc_height, fps, tmp_path)
 
         extract_proc = subprocess.Popen(extract_cmd, stdout=subprocess.PIPE,
                                         stderr=subprocess.DEVNULL)
@@ -2199,7 +2215,11 @@ def blur_license_plates(
                     if plates:
                         total_plates += len(plates)
 
-                    if debug_overlay:
+                    if redact_mode == "matte":
+                        frame = render_matte_frame(
+                            frame.shape[0], frame.shape[1], plates or [],
+                            padding=blur_padding, feather=matte_feather)
+                    elif debug_overlay:
                         frame = draw_extended_overlay(
                             frame, plates, vehicles,
                             tracker=tracker,
@@ -2265,11 +2285,15 @@ def blur_license_plates(
         print(f"\n  Processed : {frame_num} frames")
         print(f"  Detections: {total_plates} plate regions {action}")
 
-        print("  Encoding final output (lossless HEVC + audio sync fix)...")
-        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-        mux_audio(tmp_path, input_path, output_path, start_time, end_time, fps,
-                  total_frames=frame_num, preset=preset, tmp_dir=tmp_dir,
-                  quality=quality)
+        if redact_mode == "matte":
+            print(f"  Matte written directly to {output_path} "
+                  f"(codec: {matte_codec}, no audio, no HEVC mux).")
+        else:
+            print("  Encoding final output (lossless HEVC + audio sync fix)...")
+            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+            mux_audio(tmp_path, input_path, output_path, start_time, end_time, fps,
+                      total_frames=frame_num, preset=preset, tmp_dir=tmp_dir,
+                      quality=quality)
 
         # End-of-run summary: hardware, timing, throughput, mode, settings.
         _elapsed_total = time.perf_counter() - _run_start_ts
