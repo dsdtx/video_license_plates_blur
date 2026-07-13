@@ -668,6 +668,23 @@ def render_matte_frame(height, width, rects, padding=8, feather=0):
     return matte
 
 
+def resolve_matte_output_path(output_path, codec):
+    """
+    Return an output path whose container extension matches the matte codec:
+    'prores' → .mov, anything else ('hevc') → .mp4.  If the supplied path uses a
+    different extension it is replaced (a single file at the corrected path) and a
+    note is printed, so ProRes/HEVC never lands in a mismatched container.
+    """
+    ext = ".mov" if codec == "prores" else ".mp4"
+    root, cur = os.path.splitext(output_path)
+    if cur.lower() != ext:
+        corrected = root + ext
+        print(f"  Note: --matte-codec {codec} writes {ext}; "
+              f"output path changed to {corrected}")
+        return corrected
+    return output_path
+
+
 def apply_redaction(frame, rects, mode="blur",
                     blur_strength=61, color=(0, 0, 0),
                     overlay_img=None, padding=8):
