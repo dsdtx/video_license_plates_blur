@@ -883,6 +883,10 @@ def build_ffmpeg_encode_prores(width, height, fps, out_path):
     falling back to the portable CPU prores_ks encoder.  Availability is probed
     up front because the frame stream cannot be replayed to a fallback mid-run.
     """
+    # Note: prores_videotoolbox does not write a color_range atom, so ffprobe
+    # reports color_range=tv on the output even with -color_range pc.  The sample
+    # values are still full-range (verified: white in → 255 out), so the matte
+    # keys cleanly; the tag is cosmetic.
     if _ffmpeg_encoder_available("prores_videotoolbox"):
         codec_args = ["-c:v", "prores_videotoolbox", "-profile:v", "hq"]
     else:

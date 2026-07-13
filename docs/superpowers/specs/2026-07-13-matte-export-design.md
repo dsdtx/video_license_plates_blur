@@ -137,6 +137,12 @@ The matte is frame-accurate to the source: same resolution, same fps, and it hon
 `--start`/`--end` trim so it aligns on the timeline. No audio is written (a matte
 needs none).
 
+**Verified caveat (ProRes range tag):** `prores_videotoolbox` does not write a
+`color_range` atom, so ffprobe reports `color_range=tv` on the ProRes output even with
+`-color_range pc`. The *sample values* are nonetheless full-range — a pure-white input
+frame decodes back to 255 — so the matte keys cleanly (white = fully on, black = fully
+off). The tag is cosmetic. The HEVC path tags `color_range=pc` correctly.
+
 ## Pipeline Integration
 
 - One branch at the redaction site: when `mode == "matte"`, render the matte frame
