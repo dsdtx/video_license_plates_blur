@@ -640,6 +640,34 @@ def apply_image_overlay(frame, rects, overlay_img, padding=8):
     return frame
 
 
+def render_matte_frame(height, width, rects, padding=8, feather=0):
+    """
+    Build a luma-matte frame: a black canvas with white filled rectangles at each
+    (padded) plate region.  Used by redaction mode "matte" to export a matte for
+    compositing the redaction in an external NLE instead of baking it into the
+    footage.
+
+    rects entries follow the same shape as the redaction helpers: the first four
+    values are x1, y1, x2, y2 (any further elements — e.g. source tags — ignored).
+
+    feather > 0 softens the whole matte with a Gaussian of that radius
+    (kernel size 2*feather + 1), so the driven blur can fade at plate edges.
+    """
+    matte = np.zeros((height, width, 3), dtype=np.uint8)
+    for rect in rects:
+        x1, y1, x2, y2 = rect[:4]
+        x1 = max(0, x1 - padding)
+        y1 = max(0, y1 - padding)
+        x2 = min(width, x2 + padding)
+        y2 = min(height, y2 + padding)
+        if x2 > x1 and y2 > y1:
+            cv2.rectangle(matte, (x1, y1), (x2, y2), (255, 255, 255), -1)
+    if feather and feather > 0:
+        k = int(feather) * 2 + 1
+        matte = cv2.GaussianBlur(matte, (k, k), 0)
+    return matte
+
+
 def apply_redaction(frame, rects, mode="blur",
                     blur_strength=61, color=(0, 0, 0),
                     overlay_img=None, padding=8):
