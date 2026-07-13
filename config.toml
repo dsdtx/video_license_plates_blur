@@ -109,7 +109,17 @@ vehicle_crop_scale = 1.0
 # "blur"  → Gaussian blur (default, original behaviour)
 # "color" → solid colour fill
 # "image" → custom image stretched onto every plate
+# "matte" → export a white-on-black luma matte (footage left untouched)
 mode = "blur"
+
+# For mode = "matte": edge-softening radius in pixels (0 = hard edges).
+# Overridden on the CLI with --matte-feather.
+matte_feather = 0
+
+# For mode = "matte": output codec.  "prores" → ProRes 422 HQ .mov (best for
+# NLE round-trip); "hevc" → near-lossless HEVC .mp4 (GPU-accelerated on PC).
+# Overridden on the CLI with --matte-codec.
+matte_codec = "prores"
 
 # Default fill colour for mode = "color"  (R,G,B, 0-255)
 # CLI: --color 255,0,0

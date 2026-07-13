@@ -46,3 +46,7 @@ __pycache__/
 *.log
 test_frame.png
 test_frame_blurred.png
+
+# Local-only spec preview render helpers (not part of the shipped repo)
+docs/superpowers/specs/_render_md.py
+docs/superpowers/specs/*.html

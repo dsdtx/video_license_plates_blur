@@ -640,6 +640,51 @@ def apply_image_overlay(frame, rects, overlay_img, padding=8):
     return frame
 
 
+def render_matte_frame(height, width, rects, padding=8, feather=0):
+    """
+    Build a luma-matte frame: a black canvas with white filled rectangles at each
+    (padded) plate region.  Used by redaction mode "matte" to export a matte for
+    compositing the redaction in an external NLE instead of baking it into the
+    footage.
+
+    rects entries follow the same shape as the redaction helpers: the first four
+    values are x1, y1, x2, y2 (any further elements — e.g. source tags — ignored).
+
+    feather > 0 softens the whole matte with a Gaussian of that radius
+    (kernel size 2*feather + 1), so the driven blur can fade at plate edges.
+    """
+    matte = np.zeros((height, width, 3), dtype=np.uint8)
+    for rect in rects:
+        x1, y1, x2, y2 = rect[:4]
+        x1 = max(0, x1 - padding)
+        y1 = max(0, y1 - padding)
+        x2 = min(width, x2 + padding)
+        y2 = min(height, y2 + padding)
+        if x2 > x1 and y2 > y1:
+            cv2.rectangle(matte, (x1, y1), (x2, y2), (255, 255, 255), -1)
+    if feather and feather > 0:
+        k = int(feather) * 2 + 1
+        matte = cv2.GaussianBlur(matte, (k, k), 0)
+    return matte
+
+
+def resolve_matte_output_path(output_path, codec):
+    """
+    Return an output path whose container extension matches the matte codec:
+    'prores' → .mov, anything else ('hevc') → .mp4.  If the supplied path uses a
+    different extension it is replaced (a single file at the corrected path) and a
+    note is printed, so ProRes/HEVC never lands in a mismatched container.
+    """
+    ext = ".mov" if codec == "prores" else ".mp4"
+    root, cur = os.path.splitext(output_path)
+    if cur.lower() != ext:
+        corrected = root + ext
+        print(f"  Note: --matte-codec {codec} writes {ext}; "
+              f"output path changed to {corrected}")
+        return corrected
+    return output_path
+
+
 def apply_redaction(frame, rects, mode="blur",
                     blur_strength=61, color=(0, 0, 0),
                     overlay_img=None, padding=8):
@@ -815,6 +860,73 @@ def build_ffmpeg_encode_lossless(width, height, fps, out_path):
     ]
 
 
+def _ffmpeg_encoder_available(encoder: str) -> bool:
+    """True if the named ffmpeg video encoder can be initialised on this machine.
+
+    Returns False (rather than raising) if ffmpeg itself is not on PATH, so callers
+    fall back to the portable CPU encoder instead of crashing during a probe.
+    """
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-f", "lavfi", "-i", "nullsrc",
+             "-t", "0", "-c:v", encoder, "-f", "null", "-"],
+            capture_output=True)
+    except FileNotFoundError:
+        return False
+    return r.returncode == 0
+
+
+def build_ffmpeg_encode_prores(width, height, fps, out_path):
+    """
+    Build ffmpeg command: raw BGR frames from stdin → ProRes 422 HQ (.mov),
+    full-range luma.  Prefers the hardware VideoToolbox encoder (Apple platforms),
+    falling back to the portable CPU prores_ks encoder.  Availability is probed
+    up front because the frame stream cannot be replayed to a fallback mid-run.
+    """
+    # Note: prores_videotoolbox does not write a color_range atom, so ffprobe
+    # reports color_range=tv on the output even with -color_range pc.  The sample
+    # values are still full-range (verified: white in → 255 out), so the matte
+    # keys cleanly; the tag is cosmetic.
+    if _ffmpeg_encoder_available("prores_videotoolbox"):
+        codec_args = ["-c:v", "prores_videotoolbox", "-profile:v", "hq"]
+    else:
+        codec_args = ["-c:v", "prores_ks", "-profile:v", "3"]
+    return [
+        "ffmpeg", "-y",
+        "-f", "rawvideo", "-pix_fmt", "bgr24",
+        "-s", f"{width}x{height}", "-r", str(fps),
+        "-i", "pipe:0",
+        *codec_args,
+        "-pix_fmt", "yuv422p10le",
+        "-color_range", "pc",
+        out_path,
+    ]
+
+
+def build_ffmpeg_encode_hevc_matte(width, height, fps, out_path):
+    """
+    Build ffmpeg command: raw BGR frames from stdin → near-lossless HEVC (.mp4),
+    full-range.  Performance escape hatch for PC/NVIDIA users where CPU ProRes is
+    too slow: prefers GPU hevc_nvenc, falling back to CPU libx265.  A luma matte
+    survives HEVC cleanly (signal is in luma; chroma is flat).
+    """
+    if _ffmpeg_encoder_available("hevc_nvenc"):
+        codec_args = ["-c:v", "hevc_nvenc", "-rc", "vbr", "-cq", "12", "-preset", "p4"]
+    else:
+        codec_args = ["-c:v", "libx265", "-crf", "12", "-preset", "medium"]
+    return [
+        "ffmpeg", "-y",
+        "-f", "rawvideo", "-pix_fmt", "bgr24",
+        "-s", f"{width}x{height}", "-r", str(fps),
+        "-i", "pipe:0",
+        *codec_args,
+        "-tag:v", "hvc1",
+        "-pix_fmt", "yuv420p",
+        "-color_range", "pc",
+        out_path,
+    ]
+
+
 def _ffmpeg_with_progress(cmd, total_frames, desc="  Encoding"):
     """Run an ffmpeg command and show a tqdm frame progress bar. Returns (returncode, stderr)."""
     # Insert -progress pipe:1 -nostats right after 'ffmpeg'
@@ -930,11 +1042,7 @@ def mux_audio(video_only_path, original_path, output_path,
         # ── Mux video (FFV1, t=0) + extracted audio (t=0) → final output ─────
         # Use hevc_nvenc (GPU) if available, fall back to libx265 (CPU)
         def _nvenc_available():
-            r = subprocess.run(
-                ["ffmpeg", "-hide_banner", "-f", "lavfi", "-i", "nullsrc",
-                 "-t", "0", "-c:v", "hevc_nvenc", "-f", "null", "-"],
-                capture_output=True)
-            return r.returncode == 0
+            return _ffmpeg_encoder_available("hevc_nvenc")
 
         # Capture source colorimetry so we can re-tag the output with the same
         # BT.709 (or whatever the source had) values.  The raw-BGR pipe strips
@@ -1918,9 +2026,15 @@ def blur_license_plates(
     redact_mode: str = "blur",
     redact_color: tuple = (0, 0, 0),
     redact_image_path: str = None,
+    matte_feather: int = 0,
+    matte_codec: str = "prores",
 ):
     if tmp_dir == "auto":
         tmp_dir = os.path.join(tempfile.gettempdir(), "plate-blur-tmp")
+
+    # Matte mode dictates the container; correct the extension before we print it.
+    if redact_mode == "matte":
+        output_path = resolve_matte_output_path(output_path, matte_codec)
     # Capture wall-clock start so we can report total + processing-only time
     # at the end. Uses a different name from the `start_time` parameter (which
     # is the video trim start, not a timestamp).
@@ -2016,7 +2130,17 @@ def blur_license_plates(
                 video_codec = None   # None → build_ffmpeg_extract uses software path
 
         extract_cmd = build_ffmpeg_extract(input_path, start_time, end_time, codec=video_codec)
-        encode_cmd  = build_ffmpeg_encode_lossless(enc_width, enc_height, fps, tmp_path)
+        if redact_mode == "matte":
+            if matte_codec == "hevc":
+                encode_cmd = build_ffmpeg_encode_hevc_matte(
+                    enc_width, enc_height, fps, output_path)
+            else:
+                encode_cmd = build_ffmpeg_encode_prores(
+                    enc_width, enc_height, fps, output_path)
+            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        else:
+            encode_cmd = build_ffmpeg_encode_lossless(
+                enc_width, enc_height, fps, tmp_path)
 
         extract_proc = subprocess.Popen(extract_cmd, stdout=subprocess.PIPE,
                                         stderr=subprocess.DEVNULL)
@@ -2102,7 +2226,11 @@ def blur_license_plates(
                     if plates:
                         total_plates += len(plates)
 
-                    if debug_overlay:
+                    if redact_mode == "matte":
+                        frame = render_matte_frame(
+                            frame.shape[0], frame.shape[1], plates or [],
+                            padding=blur_padding, feather=matte_feather)
+                    elif debug_overlay:
                         frame = draw_extended_overlay(
                             frame, plates, vehicles,
                             tracker=tracker,
@@ -2168,11 +2296,15 @@ def blur_license_plates(
         print(f"\n  Processed : {frame_num} frames")
         print(f"  Detections: {total_plates} plate regions {action}")
 
-        print("  Encoding final output (lossless HEVC + audio sync fix)...")
-        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-        mux_audio(tmp_path, input_path, output_path, start_time, end_time, fps,
-                  total_frames=frame_num, preset=preset, tmp_dir=tmp_dir,
-                  quality=quality)
+        if redact_mode == "matte":
+            print(f"  Matte written directly to {output_path} "
+                  f"(codec: {matte_codec}, no audio, no HEVC mux).")
+        else:
+            print("  Encoding final output (lossless HEVC + audio sync fix)...")
+            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+            mux_audio(tmp_path, input_path, output_path, start_time, end_time, fps,
+                      total_frames=frame_num, preset=preset, tmp_dir=tmp_dir,
+                      quality=quality)
 
         # End-of-run summary: hardware, timing, throughput, mode, settings.
         _elapsed_total = time.perf_counter() - _run_start_ts
@@ -2274,10 +2406,23 @@ Examples:
                              "typical dashcam distances. Blur always at full res.")
     parser.add_argument("--mode", dest="mode",
                         default=red.get("mode", "blur"),
-                        choices=["blur", "color", "image"],
+                        choices=["blur", "color", "image", "matte"],
                         help="Redaction style applied to detected plates "
                              "(default: blur). "
-                             "color = solid fill, image = stretched overlay.")
+                             "color = solid fill, image = stretched overlay, "
+                             "matte = export a white-on-black luma matte (no blur "
+                             "baked in; footage is not re-encoded).")
+    parser.add_argument("--matte-feather", dest="matte_feather", type=int,
+                        default=int(red.get("matte_feather", 0)),
+                        metavar="N",
+                        help="For --mode matte: Gaussian edge-softening radius in "
+                             "pixels (default: 0 = hard edges).")
+    parser.add_argument("--matte-codec", dest="matte_codec",
+                        default=red.get("matte_codec", "prores"),
+                        choices=["prores", "hevc"],
+                        help="For --mode matte: output codec. prores → ProRes 422 "
+                             "HQ .mov (default). hevc → near-lossless HEVC .mp4 "
+                             "(GPU-accelerated via NVENC where available).")
     parser.add_argument("--color", dest="color",
                         default=red.get("color", "0,0,0"),
                         metavar="R,G,B",
@@ -2345,6 +2490,8 @@ Examples:
         redact_mode=args.mode,
         redact_color=redact_color,
         redact_image_path=args.image if args.mode == "image" else None,
+        matte_feather=args.matte_feather,
+        matte_codec=args.matte_codec,
     )
 
 
