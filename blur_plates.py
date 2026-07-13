@@ -860,6 +860,62 @@ def build_ffmpeg_encode_lossless(width, height, fps, out_path):
     ]
 
 
+def _ffmpeg_encoder_available(encoder: str) -> bool:
+    """True if the named ffmpeg video encoder can be initialised on this machine."""
+    r = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-f", "lavfi", "-i", "nullsrc",
+         "-t", "0", "-c:v", encoder, "-f", "null", "-"],
+        capture_output=True)
+    return r.returncode == 0
+
+
+def build_ffmpeg_encode_prores(width, height, fps, out_path):
+    """
+    Build ffmpeg command: raw BGR frames from stdin → ProRes 422 HQ (.mov),
+    full-range luma.  Prefers the hardware VideoToolbox encoder (Apple platforms),
+    falling back to the portable CPU prores_ks encoder.  Availability is probed
+    up front because the frame stream cannot be replayed to a fallback mid-run.
+    """
+    if _ffmpeg_encoder_available("prores_videotoolbox"):
+        codec_args = ["-c:v", "prores_videotoolbox", "-profile:v", "hq"]
+    else:
+        codec_args = ["-c:v", "prores_ks", "-profile:v", "3"]
+    return [
+        "ffmpeg", "-y",
+        "-f", "rawvideo", "-pix_fmt", "bgr24",
+        "-s", f"{width}x{height}", "-r", str(fps),
+        "-i", "pipe:0",
+        *codec_args,
+        "-pix_fmt", "yuv422p10le",
+        "-color_range", "pc",
+        out_path,
+    ]
+
+
+def build_ffmpeg_encode_hevc_matte(width, height, fps, out_path):
+    """
+    Build ffmpeg command: raw BGR frames from stdin → near-lossless HEVC (.mp4),
+    full-range.  Performance escape hatch for PC/NVIDIA users where CPU ProRes is
+    too slow: prefers GPU hevc_nvenc, falling back to CPU libx265.  A luma matte
+    survives HEVC cleanly (signal is in luma; chroma is flat).
+    """
+    if _ffmpeg_encoder_available("hevc_nvenc"):
+        codec_args = ["-c:v", "hevc_nvenc", "-rc", "vbr", "-cq", "12", "-preset", "p4"]
+    else:
+        codec_args = ["-c:v", "libx265", "-crf", "12", "-preset", "medium"]
+    return [
+        "ffmpeg", "-y",
+        "-f", "rawvideo", "-pix_fmt", "bgr24",
+        "-s", f"{width}x{height}", "-r", str(fps),
+        "-i", "pipe:0",
+        *codec_args,
+        "-tag:v", "hvc1",
+        "-pix_fmt", "yuv420p",
+        "-color_range", "pc",
+        out_path,
+    ]
+
+
 def _ffmpeg_with_progress(cmd, total_frames, desc="  Encoding"):
     """Run an ffmpeg command and show a tqdm frame progress bar. Returns (returncode, stderr)."""
     # Insert -progress pipe:1 -nostats right after 'ffmpeg'
@@ -975,11 +1031,7 @@ def mux_audio(video_only_path, original_path, output_path,
         # ── Mux video (FFV1, t=0) + extracted audio (t=0) → final output ─────
         # Use hevc_nvenc (GPU) if available, fall back to libx265 (CPU)
         def _nvenc_available():
-            r = subprocess.run(
-                ["ffmpeg", "-hide_banner", "-f", "lavfi", "-i", "nullsrc",
-                 "-t", "0", "-c:v", "hevc_nvenc", "-f", "null", "-"],
-                capture_output=True)
-            return r.returncode == 0
+            return _ffmpeg_encoder_available("hevc_nvenc")
 
         # Capture source colorimetry so we can re-tag the output with the same
         # BT.709 (or whatever the source had) values.  The raw-BGR pipe strips
