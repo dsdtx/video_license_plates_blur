@@ -2402,10 +2402,23 @@ Examples:
                              "typical dashcam distances. Blur always at full res.")
     parser.add_argument("--mode", dest="mode",
                         default=red.get("mode", "blur"),
-                        choices=["blur", "color", "image"],
+                        choices=["blur", "color", "image", "matte"],
                         help="Redaction style applied to detected plates "
                              "(default: blur). "
-                             "color = solid fill, image = stretched overlay.")
+                             "color = solid fill, image = stretched overlay, "
+                             "matte = export a white-on-black luma matte (no blur "
+                             "baked in; footage is not re-encoded).")
+    parser.add_argument("--matte-feather", dest="matte_feather", type=int,
+                        default=int(red.get("matte_feather", 0)),
+                        metavar="N",
+                        help="For --mode matte: Gaussian edge-softening radius in "
+                             "pixels (default: 0 = hard edges).")
+    parser.add_argument("--matte-codec", dest="matte_codec",
+                        default=red.get("matte_codec", "prores"),
+                        choices=["prores", "hevc"],
+                        help="For --mode matte: output codec. prores → ProRes 422 "
+                             "HQ .mov (default). hevc → near-lossless HEVC .mp4 "
+                             "(GPU-accelerated via NVENC where available).")
     parser.add_argument("--color", dest="color",
                         default=red.get("color", "0,0,0"),
                         metavar="R,G,B",
@@ -2473,6 +2486,8 @@ Examples:
         redact_mode=args.mode,
         redact_color=redact_color,
         redact_image_path=args.image if args.mode == "image" else None,
+        matte_feather=args.matte_feather,
+        matte_codec=args.matte_codec,
     )
 
 
